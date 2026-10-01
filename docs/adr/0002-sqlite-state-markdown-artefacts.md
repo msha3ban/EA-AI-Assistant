@@ -1,0 +1,3 @@
+# Meeting state in SQLite, documents as Markdown files
+
+Documents (Transcript, English Transcript, Summary, MoM) are Markdown files in one folder per Meeting so they stay readable and easy to edit and export, but all state (stages, revisions, Stale flags, Flagged Passages, Evidence, queue and worker lock) lives in a single SQLite file. The web UI, CLI and background worker change the same Meeting concurrently, and hand-built locking over loose metadata files risked a worker publishing an output from an old Transcript over the user's correction or leaving inconsistent state after a crash. SQLite gives transactions and crash recovery without a database server, which keeps the tool a single-user local install (ADR-0001).

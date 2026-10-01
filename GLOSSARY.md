@@ -35,11 +35,11 @@ A distinct voice in a Transcript. Starts anonymous ("Speaker 1") and may be name
 _Avoid_: Participant (for the voice), attendee
 
 **Flagged Passage**:
-A part of a Transcript the system is unsure it heard correctly and asks the user to check. Correcting one makes the Meeting's outputs Stale.
+A part of a Transcript the system has detected as an accuracy risk, with a stated reason, and asks the user to check. Unflagged text is not guaranteed correct. Correcting one makes the Meeting's outputs Stale.
 _Avoid_: Warning, error, low-confidence segment
 
 **Vocabulary**:
-The user-maintained list of proper names, system names and acronyms that must be spelled exactly as listed. There is one global Vocabulary and optionally one per Topic.
+The user-maintained list of proper names, system names and acronyms, each with one canonical spelling and any aliases it may be heard as (Arabic script, English, acronym). There is one global Vocabulary and optionally one per Topic.
 _Avoid_: Dictionary, glossary (reserved for this file), terms list
 
 ### Meeting outputs
@@ -53,12 +53,16 @@ A structured English record of a Meeting: purpose, discussion points, numbered D
 _Avoid_: Minutes, notes, meeting report
 
 **Approved MoM**:
-A MoM the user has confirmed as correct. Only Approved MoMs are used beyond their own Meeting (e.g. for an HLD).
+A specific version of a MoM the user has confirmed as correct. It stays the Meeting's Approved MoM until the user approves a newer version. Only Approved MoMs are used beyond their own Meeting (e.g. for an HLD).
 _Avoid_: Final MoM, signed-off minutes
 
 **Stale**:
-The state of a Summary or MoM whose Transcript has changed since it was generated.
+The state of an English Transcript, Summary or MoM whose inputs (Transcript, English Transcript, Speaker names, Recording order) have changed since it was generated.
 _Avoid_: Outdated, dirty
+
+**Evidence**:
+The Transcript passages a Decision, Action Item or Technical Details entry was derived from, so the user can check it against what was actually said.
+_Avoid_: Source, citation, reference
 
 **Decision**:
 A conclusion that the Meeting agreed on and that a MoM records.
