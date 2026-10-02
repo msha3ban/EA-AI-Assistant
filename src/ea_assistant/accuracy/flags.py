@@ -59,10 +59,11 @@ def flag_recall(
     threshold: float = 0.25,
     logprob_threshold: float = -0.8,
     duration: float = 1.0,
+    aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    ref_chars = list(normalize(reference).replace(" ", ""))
+    ref_chars = list(normalize(reference, aliases).replace(" ", ""))
     segment_chars = [
-        list(normalize(segment.text).replace(" ", "")) for segment in segments
+        list(normalize(segment.text, aliases).replace(" ", "")) for segment in segments
     ]
     hypothesis = [char for chars in segment_chars for char in chars]
     boundaries: list[int] = []

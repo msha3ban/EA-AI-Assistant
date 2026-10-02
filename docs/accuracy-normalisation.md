@@ -11,4 +11,6 @@ The published normalisation rules are applied in this order:
 5. Lowercase Latin text, remove punctuation (Arabic and Latin punctuation), and collapse whitespace.
 6. If Vocabulary is provided, map every alias to its canonical spelling in both the reference and hypothesis before scoring. Vocabulary scoring separately counts either canonical or alias as recognised and exact canonical spelling as canonical.
 
+Flagged Passage scoring applies the same alias normalisation to the reference and each segment before aligning characters and counting real-error segments.
+
 Numbers are compared as multisets. The hand-written number-word coverage includes common Egyptian/MSA forms from zero through twenty (including تلات/تلاتة, تمانية, عشرة/عشره), tens, MSA hundred forms, Egyptian 100–900 forms including مية/ميه and ميتين through تسعمية, and thousand forms including ألفين/الفين = 2,000. It does not parse arbitrary compound number phrases (such as “twenty-five” spoken as words), gender/declension variants not listed in the implementation, fractions, or spoken decimals; digit strings support integers, decimals, and comma-separated thousands.

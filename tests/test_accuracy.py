@@ -164,6 +164,16 @@ def test_flag_recall_per_signal_exact() -> None:
     assert result["combined"]["flagged_segments"] == 2
 
 
+def test_flag_recall_normalizes_vocabulary_aliases() -> None:
+    result = flag_recall(
+        "checkout",
+        [Segment("s1", 0, 1, "تشيك اوت")],
+        aliases={"تشيك اوت": "checkout"},
+    )
+    assert result["real_errors"] == 0
+    assert result["segments"][0]["real_error"] is False
+
+
 def test_report_uses_na_for_undefined_flag_metrics() -> None:
     result = flag_recall("same", [Segment("s1", 0, 1, "same")])
     assert result["combined"]["recall"] is None

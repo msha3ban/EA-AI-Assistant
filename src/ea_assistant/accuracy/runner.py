@@ -89,7 +89,7 @@ class TwoStepPipeline:
         return {
             "transcript": _serialize(score_text(reference, hypothesis, aliases)),
             "flags": flag_recall(
-                reference, segments, threshold, logprob_threshold, duration
+                reference, segments, threshold, logprob_threshold, duration, aliases
             ),
             "vocabulary": vocabulary_accuracy(reference, hypothesis, terms),
             "numbers": number_accuracy(reference, hypothesis),
@@ -495,6 +495,7 @@ def _execute_run(
                     float(data.get("flag_cer_threshold", 0.25)),
                     float(data.get("flag_logprob_threshold", -0.8)),
                     meeting.duration,
+                    aliases,
                 )
                 vocabulary = vocabulary_accuracy(reference, hypothesis, terms)
                 numbers = number_accuracy(reference, hypothesis)
