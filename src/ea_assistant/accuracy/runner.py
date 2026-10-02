@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .. import ollama
 from ..adapters import Audio
 from ..application import Application
 from ..config import AppConfig
@@ -170,11 +171,12 @@ def _serialize(value: Any) -> Any:
 
 
 _SAFE_FAILURE_MESSAGES = {
-    "Ollama returned invalid JSON",
-    "Ollama returned an incomplete or empty response",
-    "Ollama response exhausted num_ctx and may be truncated",
-    "Ollama GPU still has loaded models after cleanup timeout",
-    "Unable to verify GPU is free: Ollama /api/ps failed",
+    ollama.INVALID_JSON,
+    ollama.INCOMPLETE_RESPONSE,
+    ollama.TRUNCATED_RESPONSE,
+    ollama.GPU_CLEANUP_TIMEOUT,
+    ollama.GPU_STATUS_FAILED,
+    ollama.GPU_STATUS_INVALID,
 }
 
 
@@ -206,20 +208,59 @@ def _table(rows: list[dict[str, Any]]) -> str:
     return table(rows)
 
 
+def _map_metrics_to_row(row: dict[str, Any], metrics: dict[str, Any]) -> None:
+    transcript = metrics["transcript"]
+    if transcript is None:
+        row.update({key: "—" for key in (
+            "wer_raw", "wer_norm", "cer_raw", "cer_norm", "flag_recall",
+            "real_error_segments", "flagged_segments",
+        )})
+    else:
+        flags = metrics["flags"]["combined"]
+        row.update({
+            "wer_raw": transcript["wer_raw"]["rate"],
+            "wer_norm": transcript["wer_normalized"]["rate"],
+            "cer_raw": transcript["cer_raw"]["rate"],
+            "cer_norm": transcript["cer_normalized"]["rate"],
+            "flag_recall": flags["recall"],
+            "real_error_segments": flags["real_error_segments"],
+            "flagged_segments": flags["flagged_segments"],
+        })
+    vocabulary = metrics["vocabulary"]
+    row["vocab_recognized_percent"] = (
+        vocabulary["recognized_rate"] * 100
+        if vocabulary.get("recognized_rate") is not None else None
+    )
+    row["number_recall"] = metrics["numbers"].get("recall")
+    facts = metrics.get("facts")
+    if facts:
+        row.update({
+            "mom_found": len(facts["found"]),
+            "mom_found_expected": sum(
+                1 for fact in facts["results"]
+                if fact["status"] == "found" and fact["in_expected_section"]
+            ),
+            "mom_wrong": len(facts["wrong"]),
+            "mom_missing": len(facts["missing"]),
+            "mom_invented": len(facts["invented"]),
+        })
+    else:
+        row.update({key: "—" for key in (
+            "mom_found", "mom_found_expected", "mom_wrong", "mom_missing", "mom_invented"
+        )})
+
+
 def _markdown_detail(detail: dict[str, Any]) -> list[str]:
     if "error" in detail:
-        lines = [f"Failed: {detail['error']}"]
-        metrics = detail.get("metrics")
-        if metrics:
-            lines.append(f"Artifacts: `{detail.get('artifacts', '—')}`")
-            english = metrics.get("english_transcript")
-            if english:
-                lines.append(f"English Transcript: `{english}`")
-            lines.append("Transcript metrics are included in the run table.")
-        return lines
+        if not detail.get("metrics"):
+            return [f"Failed: {detail['error']}"]
+        failure_line = f"Failed: {detail['error']}"
+        detail = {**detail, "status": "failed"}
     metrics = detail["metrics"]
     vocabulary = metrics["vocabulary"]
     lines = [f"Status: {detail['status']}", f"Artifacts: `{detail['artifacts']}`"]
+    if "error" in detail:
+        lines.insert(0, failure_line)
     lines.extend(
         [
             "",
@@ -309,6 +350,9 @@ def _execute_run(
     app: Application | None = None
     meeting: Any = None
     aliases: dict[str, str] = {}
+    strategy: TwoStepPipeline | DirectPipeline | None = None
+    window: SamplingWindow | None = None
+    started: float | None = None
     row: dict[str, Any] = {
         "name": run["name"],
         "pipeline": run["pipeline"],
@@ -393,70 +437,10 @@ def _execute_run(
             float(data.get("flag_logprob_threshold", -0.8)),
             duration,
         )
-        if report_metrics["transcript"] is not None:
-            row.update(
-                {
-                    "wer_raw": report_metrics["transcript"]["wer_raw"]["rate"],
-                    "wer_norm": report_metrics["transcript"]["wer_normalized"]["rate"],
-                    "cer_raw": report_metrics["transcript"]["cer_raw"]["rate"],
-                    "cer_norm": report_metrics["transcript"]["cer_normalized"]["rate"],
-                    "flag_recall": report_metrics["flags"]["combined"]["recall"],
-                    "real_error_segments": report_metrics["flags"]["combined"][
-                        "real_error_segments"
-                    ],
-                    "flagged_segments": report_metrics["flags"]["combined"][
-                        "flagged_segments"
-                    ],
-                }
-            )
-        else:
-            row.update(
-                {
-                    key: "—"
-                    for key in (
-                        "wer_raw",
-                        "wer_norm",
-                        "cer_raw",
-                        "cer_norm",
-                        "flag_recall",
-                        "real_error_segments",
-                        "flagged_segments",
-                    )
-                }
-            )
         report_metrics["facts"] = (
             score_facts(result.mom.markdown, critical) if critical else None
         )
-        if report_metrics["facts"]:
-            f = report_metrics["facts"]
-            row.update(
-                {
-                    "mom_found": len(f["found"]),
-                    "mom_found_expected": sum(1 for fact in f["results"] if fact["status"] == "found" and fact["in_expected_section"]),
-                    "mom_wrong": len(f["wrong"]),
-                    "mom_missing": len(f["missing"]),
-                    "mom_invented": len(f["invented"]),
-                }
-            )
-        else:
-            row.update(
-                {
-                    key: "—"
-                    for key in (
-                        "mom_found",
-                        "mom_found_expected",
-                        "mom_wrong",
-                        "mom_missing",
-                        "mom_invented",
-                    )
-                }
-            )
-        row["vocab_recognized_percent"] = (
-            report_metrics["vocabulary"]["recognized_rate"] * 100
-            if report_metrics["vocabulary"].get("recognized_rate") is not None
-            else None
-        )
-        row["number_recall"] = report_metrics["numbers"].get("recall")
+        _map_metrics_to_row(row, report_metrics)
         row["minutes_per_audio_hour"] = (
             elapsed / 60 / (duration / 3600) if duration else None
         )
@@ -479,43 +463,27 @@ def _execute_run(
         row["failure"] = thermal_reason or _safe_failure(exc, app)
         log.warning("Accuracy run %s failed (%s)", run["name"], type(exc).__name__)
         detail = {"error": row["failure"]}
-        transcript_path = meeting.folder / "transcript.md" if meeting is not None else None
-        if transcript_path is not None and transcript_path.exists():
-            text = transcript_path.read_text(encoding="utf-8")
-            hypothesis = "\n".join(
-                match.group(1)
-                for line in text.splitlines()
-                if (match := re.search(r"\*\*[^*]+:\*\* (.*)$", line))
-            )
-            if hypothesis:
-                metrics = _serialize(score_text(reference, hypothesis, aliases))
-                segments = app.store.segments(meeting.id) if app is not None else []
-                flags = flag_recall(
-                    reference, segments,
-                    float(data.get("flag_cer_threshold", 0.25)),
-                    float(data.get("flag_logprob_threshold", -0.8)),
-                    meeting.duration,
-                    aliases,
-                )
-                vocabulary = vocabulary_accuracy(reference, hypothesis, terms)
-                numbers = number_accuracy(reference, hypothesis)
-                detail["metrics"] = {
-                    "transcript": _serialize(metrics), "flags": flags,
-                    "vocabulary": vocabulary, "numbers": numbers,
-                    "english_transcript": str(meeting.folder / "english-transcript.md")
-                    if (meeting.folder / "english-transcript.md").exists() else None,
-                }
-                for key, metric_key in (("wer_raw", "wer_raw"), ("wer_norm", "wer_normalized"),
-                                        ("cer_raw", "cer_raw"), ("cer_norm", "cer_normalized")):
-                    row[key] = metrics[metric_key]["rate"]
-                row["vocab_recognized_percent"] = vocabulary["recognized_rate"] * 100 if vocabulary.get("recognized_rate") is not None else None
-                row["number_recall"] = numbers.get("recall")
-                combined = flags["combined"]
-                row.update({"flag_recall": combined["recall"],
-                            "real_error_segments": combined["real_error_segments"],
-                            "flagged_segments": combined["flagged_segments"]})
         if meeting is not None:
             detail["artifacts"] = str(meeting.folder)
+            segments = app.store.segments(meeting.id) if app is not None else []
+            if strategy is not None and segments:
+                hypothesis = "\n".join(segment.text for segment in segments)
+                metrics = strategy.score(
+                    reference, hypothesis, segments, aliases, terms,
+                    float(data.get("flag_cer_threshold", 0.25)),
+                    float(data.get("flag_logprob_threshold", -0.8)), meeting.duration,
+                )
+                metrics["facts"] = None
+                english_path = meeting.folder / "english-transcript.md"
+                metrics["english_transcript"] = str(english_path) if english_path.exists() else None
+                _map_metrics_to_row(row, metrics)
+                detail["metrics"] = metrics
+                detail["resource"] = window.result() if window is not None else {}
+                elapsed = time.perf_counter() - started if started is not None else 0.0
+                detail["elapsed_seconds"] = elapsed
+                detail["minutes_per_audio_hour"] = elapsed / 60 / (meeting.duration / 3600) if meeting.duration else None
+                row["minutes_per_audio_hour"] = detail["minutes_per_audio_hour"]
+                row.update(detail["resource"])
     return row, detail
 
 

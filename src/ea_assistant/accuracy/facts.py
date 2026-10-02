@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..domain import FactKind
+from ..domain import FactKind, FactSection
+from ..render import SECTION_HEADINGS
 from .metrics import normalize
 from .toml_io import load_toml
 
@@ -102,28 +103,33 @@ def score_facts(
     }
     current = ""
     current_label = ""
+    in_table_body = False
     all_entries: list[dict[str, str]] = []
     for line in markdown.splitlines():
         if line.startswith("## "):
+            in_table_body = False
             current_label = line[3:].strip()
             heading = current_label.lower()
             current = (
                 "decision"
-                if heading == "decisions"
+                if heading == SECTION_HEADINGS[FactSection.DECISIONS][3:].lower()
                 else "action_item"
-                if heading == "action items"
+                if heading == SECTION_HEADINGS[FactSection.ACTION_ITEMS][3:].lower()
                 else "technical_detail"
-                if heading == "technical details"
+                if heading == SECTION_HEADINGS[FactSection.TECHNICAL_DETAILS][3:].lower()
                 else ""
             )
-        elif line.startswith("|") and not re.search(r"---", line):
+        elif line.startswith("|"):
+            if re.fullmatch(r"\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?", line):
+                in_table_body = True
+                continue
             cols = [col.strip() for col in line.strip("|").split("|")]
-            if len(cols) >= 4 and cols[0] != "#":
+            if in_table_body and len(cols) >= 4 and cols[0] != "#":
                 entry = {"text": cols[1], "owner": cols[2], "due": cols[3], "section": current_label}
                 if current == "action_item":
                     sections[current].append(entry)
                 all_entries.append(entry)
-        elif line.lstrip().startswith(("-", "*")):
+        elif re.match(r"\s*(?:- |\* )\S", line):
             entry = {"text": line, "owner": "", "due": "", "section": current_label}
             if (current == "decision" and re.match(r"\s*-\s*D\d+:", line)) or current == "technical_detail":
                 sections[current].append(entry)
@@ -151,7 +157,8 @@ def score_facts(
             ]
             expected_candidates = candidates
         elif kind in sections:
-            fallback = [entry for entry in all_entries if entry not in expected_candidates]
+            expected_ids = {id(entry) for entry in expected_candidates}
+            fallback = [entry for entry in all_entries if id(entry) not in expected_ids]
             candidates = [*expected_candidates, *fallback]
         anchor_matches = [
             (i, entry)
@@ -217,8 +224,7 @@ def score_facts(
             matched.add(id(wrong_matches[0][1]))
         elif action_mismatches:
             wrong.append(str(fact["id"]))
-            mismatch_index, _, reasons = action_mismatches[0]
-            mismatch_entry = next(entry for i, entry, _ in action_mismatches if i == mismatch_index)
+            _, mismatch_entry, reasons = action_mismatches[0]
             results.append(
                 {
                     "id": str(fact["id"]),

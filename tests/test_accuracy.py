@@ -27,6 +27,7 @@ from ea_assistant.accuracy.runner import (
     run_suite,
 )
 from ea_assistant.accuracy.suite import Suite, SuiteRun, load_suite, merge_config
+from ea_assistant.adapters import RetryableLLMResponseError
 from ea_assistant.application import Application
 from ea_assistant.config import AppConfig
 from ea_assistant.domain import FACT_SECTIONS
@@ -253,6 +254,18 @@ def test_critical_facts_match_other_mom_sections_and_report_location() -> None:
     assert result["results"][0]["section"] == "Purpose / Agenda"
     assert result["results"][0]["in_expected_section"] is False
     assert "- Use Kafka for integration" not in result["invented"]
+
+
+def test_wrong_if_matches_summary_even_when_expected_section_has_correct_match() -> None:
+    result = score_facts(
+        "Date: 2026-10-01\nState: Draft\n## Summary\nRabbitMQ replaces Kafka.\n"
+        "## Decisions\n| # | Item | Owner | Due | Evidence |\n|---|---|---|---|---|\n"
+        "- D1: Use Kafka for integration",
+        [{"id": "F1", "kind": "decision", "statement": "Use Kafka",
+          "expect": ["kafka"], "anchor": ["kafka"], "wrong_if": ["rabbitmq"]}],
+    )
+    assert result["wrong"] == ["F1"]
+    assert result["results"][0]["section"] == "Summary"
 
 
 def test_critical_facts_load_as_frozen_typed_values(tmp_path: Path) -> None:
@@ -753,6 +766,7 @@ def test_timeout_failure_names_stage_type_and_configured_duration(
         audio_preparer=FakeAudio(),
     )
     assert report["runs"][0]["failure"] == "extract: TimeoutError after 600 s"
+    assert report["runs"][0]["wer_raw"] == "—"
     assert "private transport detail" not in str(report)
 
 
@@ -766,7 +780,7 @@ def test_failed_extract_keeps_transcript_metrics_and_safe_ollama_message(
 
     def fail_extract(instructions: str, content: dict[str, str]) -> str:
         if instructions.startswith("Extract"):
-            raise RuntimeError("Ollama returned invalid JSON")
+            raise RetryableLLMResponseError("Ollama returned invalid JSON")
         if instructions.startswith("Translate"):
             return json.dumps(content)
         return "{}"
@@ -785,8 +799,13 @@ def test_failed_extract_keeps_transcript_metrics_and_safe_ollama_message(
     assert row["status"] == "failed"
     assert row["wer_raw"] == 0
     assert row["cer_raw"] == 0
-    assert row["failure"] == "extract: RuntimeError: Ollama returned invalid JSON"
+    assert row["failure"] == "extract: RetryableLLMResponseError: Ollama returned invalid JSON"
     assert report["details"]["r"]["metrics"]["english_transcript"] is not None
+    markdown = (Path(report["report_dir"]) / "report.md").read_text(encoding="utf-8")
+    assert "### Vocabulary terms" in markdown
+    assert "### Numbers" in markdown
+    assert "### Flagged Passage signals" in markdown
+    assert "SAP S/4HANA and 123" not in str(report)
 
 
 def test_summary_token_budget_failure_keeps_numeric_diagnostic(
@@ -819,3 +838,27 @@ def test_summary_token_budget_failure_keeps_numeric_diagnostic(
         ), sampler=FakeSampler(), audio_preparer=FakeAudio(),
     )
     assert report["runs"][0]["failure"] == f"summary: ValueError: {budget}"
+
+
+def test_failed_speech_to_text_reports_no_transcript_metrics(tmp_path: Path) -> None:
+    recording = tmp_path / "recording.wav"
+    recording.write_bytes(b"audio")
+    reference = tmp_path / "reference.txt"
+    reference.write_text("SAP S/4HANA and 123", encoding="utf-8")
+
+    class FailingSpeechToText(FakeSpeechToText):
+        def transcribe(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("model failed")
+
+    report = run_suite(
+        {"name": "failed", "recording": str(recording),
+         "reference_transcript": str(reference), "output_dir": str(tmp_path / "out"),
+         "run": [{"name": "r", "pipeline": "two-step"}]},
+        lambda config, settings: _make_app(
+            config, settings, stt_obj=FailingSpeechToText([]),
+        ), sampler=FakeSampler(), audio_preparer=FakeAudio(),
+    )
+    row = report["runs"][0]
+    assert row["status"] == "failed"
+    assert row.get("wer_raw", "—") == "—"
+    assert "metrics" not in report["details"]["r"]

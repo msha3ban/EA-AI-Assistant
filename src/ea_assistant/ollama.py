@@ -12,6 +12,13 @@ from .config import LLMCallConfig
 
 Transport = Callable[[str, str, bytes | None, float], bytes]
 
+INVALID_JSON = "Ollama returned invalid JSON"
+INCOMPLETE_RESPONSE = "Ollama returned an incomplete or empty response"
+TRUNCATED_RESPONSE = "Ollama response exhausted num_ctx and may be truncated"
+GPU_CLEANUP_TIMEOUT = "Ollama GPU still has loaded models after cleanup timeout"
+GPU_STATUS_FAILED = "Unable to verify GPU is free: Ollama /api/ps failed"
+GPU_STATUS_INVALID = "Unable to verify GPU is free: invalid Ollama /api/ps response"
+
 
 class OllamaClient:
     def __init__(
@@ -118,7 +125,7 @@ class OllamaClient:
             or prompt_count + int(eval_count or 0) >= config.num_ctx
         ):
             raise RetryableLLMResponseError(
-                "Ollama response exhausted num_ctx and may be truncated"
+                TRUNCATED_RESPONSE
             )
         if (
             result.get("done_reason") == "length"
@@ -126,13 +133,13 @@ class OllamaClient:
             or not text
         ):
             raise RetryableLLMResponseError(
-                "Ollama returned an incomplete or empty response"
+                INCOMPLETE_RESPONSE
             )
         if schema is not None:
             try:
                 json.loads(text)
             except (ValueError, TypeError) as exc:
-                raise RetryableLLMResponseError("Ollama returned invalid JSON") from exc
+                raise RetryableLLMResponseError(INVALID_JSON) from exc
         return str(text)
 
     def _loaded_models(self) -> list[str]:
@@ -140,12 +147,12 @@ class OllamaClient:
             response = self._call("GET", "/api/ps")
         except (OSError, ValueError, TypeError) as exc:
             raise RuntimeError(
-                "Unable to verify GPU is free: Ollama /api/ps failed"
+                GPU_STATUS_FAILED
             ) from exc
         models = response.get("models", [])
         if not isinstance(models, list):
             raise TypeError(
-                "Unable to verify GPU is free: invalid Ollama /api/ps response"
+                GPU_STATUS_INVALID
             )
         return list(
             dict.fromkeys(
@@ -182,5 +189,5 @@ class OllamaClient:
                 self.unload(model)
             if self.clock() >= deadline and self._loaded_models():
                 raise RuntimeError(
-                    "Ollama GPU still has loaded models after cleanup timeout"
+                    GPU_CLEANUP_TIMEOUT
                 )
