@@ -6,6 +6,10 @@ from .config import LLMCallConfig, STTConfig
 from .models import Segment
 
 
+class RetryableLLMResponseError(RuntimeError):
+    """An LLM response was incomplete or could not be parsed as JSON."""
+
+
 class Audio(Protocol):
     def probe(self, path: str) -> float: ...
     def normalize(

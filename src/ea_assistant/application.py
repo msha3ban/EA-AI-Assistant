@@ -12,7 +12,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
-from .adapters import LLM, Audio, Sensors, SpeechToText
+from .adapters import LLM, Audio, RetryableLLMResponseError, Sensors, SpeechToText
 from .config import AppConfig
 from .domain import StageName
 from .models import Meeting, MeetingResult, Mom, Provenance, Segment
@@ -436,8 +436,13 @@ class Application:
     ) -> dict[str, Any]:
         config = self.config.llm.stage(stage).adapter_values(self.config.llm.model)
         serialized = json.dumps(content, ensure_ascii=False)
-        for _attempt in range(2):
-            raw = self.llm.chat(instructions, serialized, config, schema)
+        for attempt in range(2):
+            try:
+                raw = self.llm.chat(instructions, serialized, config, schema)
+            except RetryableLLMResponseError:
+                if attempt == 1:
+                    raise
+                continue
             try:
                 parsed = json.loads(raw)
             except ValueError:

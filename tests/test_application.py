@@ -4,9 +4,10 @@ from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
+from ea_assistant.adapters import RetryableLLMResponseError
 from ea_assistant.application import Application
 from ea_assistant.config import AppConfig, load_config
-from ea_assistant.domain import Pipeline, VocabularyPromptMode
+from ea_assistant.domain import Pipeline, StageName, VocabularyPromptMode
 from ea_assistant.models import Segment, VocabularyTerm
 from ea_assistant.prompts import PromptSettings
 from ea_assistant.testing import FakeAudio, FakeLLM, FakeSensors, FakeSpeechToText
@@ -80,6 +81,47 @@ def test_thermal_guard_stops_before_transcription(tmp_path: Path) -> None:
         assert "temperature unavailable" in str(exc)
     else:
         raise AssertionError("expected thermal stop")
+
+
+def test_json_call_retries_retryable_llm_response_failure(tmp_path: Path) -> None:
+    responses = iter([RetryableLLMResponseError("Ollama returned invalid JSON"), '{"ok": true}'])
+
+    def responder(_instructions: str, _content: dict[str, str]) -> str:
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    app = Application(
+        FakeAudio(), FakeSpeechToText(), FakeLLM(responder=responder), FakeSensors(), config(tmp_path)
+    )
+    result = app._json_call(
+        "Instructions", {}, StageName.EXTRACT, {}, lambda value: value == {"ok": True}
+    )
+    assert result == {"ok": True}
+    assert app.llm.calls == 2
+
+
+def test_json_call_propagates_second_retryable_failure(tmp_path: Path) -> None:
+    llm = FakeLLM(responder=lambda _instructions, _content: _raise_retryable())
+    app = Application(FakeAudio(), FakeSpeechToText(), llm, FakeSensors(), config(tmp_path))
+    try:
+        app._run_llm_stage(
+            StageName.EXTRACT,
+            lambda: app._json_call(
+                "Instructions", {}, StageName.EXTRACT, {}, lambda _value: False
+            ),
+        )
+    except RetryableLLMResponseError as exc:
+        assert str(exc) == "Ollama returned invalid JSON"
+        assert llm.calls == 2
+        assert app.last_failure_reason == "extract: RetryableLLMResponseError"
+    else:
+        raise AssertionError("expected retryable response failure")
+
+
+def _raise_retryable() -> str:
+    raise RetryableLLMResponseError("Ollama returned invalid JSON")
 
 
 def test_direct_provenance_references_supplied_transcript_and_stage_vocabulary(

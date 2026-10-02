@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.request import Request, urlopen
 
+from .adapters import RetryableLLMResponseError
 from .config import LLMCallConfig
 
 Transport = Callable[[str, str, bytes | None, float], bytes]
@@ -116,18 +117,22 @@ class OllamaClient:
             prompt_count >= config.num_ctx
             or prompt_count + int(eval_count or 0) >= config.num_ctx
         ):
-            raise RuntimeError("Ollama response exhausted num_ctx and may be truncated")
+            raise RetryableLLMResponseError(
+                "Ollama response exhausted num_ctx and may be truncated"
+            )
         if (
             result.get("done_reason") == "length"
             or result.get("done") is False
             or not text
         ):
-            raise RuntimeError("Ollama returned an incomplete or empty response")
+            raise RetryableLLMResponseError(
+                "Ollama returned an incomplete or empty response"
+            )
         if schema is not None:
             try:
                 json.loads(text)
             except (ValueError, TypeError) as exc:
-                raise RuntimeError("Ollama returned invalid JSON") from exc
+                raise RetryableLLMResponseError("Ollama returned invalid JSON") from exc
         return str(text)
 
     def _loaded_models(self) -> list[str]:
