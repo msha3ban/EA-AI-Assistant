@@ -79,6 +79,8 @@ class FakeLLM:
         self.events = events if events is not None else []
         self.calls = 0
         self.instructions: list[str] = []
+        self.contents: list[str] = []
+        self.configs: list[LLMCallConfig] = []
         self.english_transcript_calls = 0
         self.extract_calls = 0
         self.responder = responder
@@ -103,6 +105,8 @@ class FakeLLM:
         self.events.append("llm-call")
         self.calls += 1
         self.instructions.append(instructions)
+        self.contents.append(content)
+        self.configs.append(config)
         obj = json.loads(content) if content.startswith("{") else {}
         if instructions.startswith("Translate"):
             self.english_transcript_calls += 1

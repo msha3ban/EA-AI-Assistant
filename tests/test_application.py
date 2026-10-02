@@ -1,15 +1,19 @@
 import hashlib
+import json
+import math
 import sqlite3
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from ea_assistant.adapters import RetryableLLMResponseError
 from ea_assistant.application import Application
 from ea_assistant.config import AppConfig, load_config
-from ea_assistant.domain import Pipeline, StageName, VocabularyPromptMode
+from ea_assistant.domain import FACT_SECTIONS, Pipeline, StageName, VocabularyPromptMode
 from ea_assistant.models import Segment, VocabularyTerm
-from ea_assistant.prompts import PromptSettings
+from ea_assistant.prompts import SUMMARY_COMBINE, PromptSettings
 from ea_assistant.testing import FakeAudio, FakeLLM, FakeSensors, FakeSpeechToText
 
 
@@ -144,6 +148,105 @@ def test_json_call_propagates_second_retryable_failure(tmp_path: Path) -> None:
 
 def _raise_retryable() -> str:
     raise RetryableLLMResponseError("Ollama returned invalid JSON")
+
+
+def _summary_app(
+    tmp_path: Path, statements: list[str], partial_summary: str = "Partial Summary."
+) -> tuple[Application, FakeLLM]:
+    def responder(instructions: str, _content: dict[str, str]) -> str:
+        if instructions.startswith("Extract"):
+            facts = {section.value: [] for section in FACT_SECTIONS}
+            facts["discussion_points"] = [
+                {"statement": statement, "evidence": ["s0001"]}
+                for statement in statements
+            ]
+            return json.dumps(facts)
+        return "Combined Summary." if instructions == SUMMARY_COMBINE else partial_summary
+
+    llm = FakeLLM(responder=responder)
+    cfg = config(tmp_path / "data")
+    cfg = replace(cfg, llm=replace(cfg.llm, summary=replace(cfg.llm.summary, num_ctx=300, num_predict=64)))
+    app = Application(FakeAudio(), FakeSpeechToText(), llm, FakeSensors(), cfg)
+    return app, llm
+
+
+def _process_summary(app: Application, tmp_path: Path) -> str:
+    recording = tmp_path / "recording.wav"
+    recording.write_bytes(b"audio")
+    meeting = app.create_meeting(str(recording), "Planning", date(2026, 10, 1))
+    return app.process_transcript(meeting, [Segment("s0001", 0, 1, "Meeting")], 1.0).summary
+
+
+def test_summary_chunks_reconciled_facts_and_combines(tmp_path: Path) -> None:
+    app, llm = _summary_app(tmp_path, [f"Fact {index} " + "x" * 100 for index in range(12)])
+
+    assert _process_summary(app, tmp_path) == "Combined Summary.\n"
+    summary_calls = [
+        (instructions, content, call_config)
+        for instructions, content, call_config in zip(llm.instructions, llm.contents, llm.configs)
+        if instructions.startswith("Write") or instructions == SUMMARY_COMBINE
+    ]
+    partials = [content for instructions, content, _ in summary_calls if instructions.startswith("Write")]
+    assert len(partials) > 1
+    assert sum(instructions == SUMMARY_COMBINE for instructions, _, _ in summary_calls) == 1
+    assert [entry["statement"] for content in partials for entry in json.loads(content)["discussion_points"]] == [
+        f"Fact {index} " + "x" * 100 for index in range(12)
+    ]
+    for instructions, content, call_config in summary_calls:
+        assert len(content) <= (call_config.num_ctx - call_config.num_predict) * 2.5 - len(instructions) - 100
+        assert math.ceil(len(instructions + "\n<meeting-content>\n" + content + "\n</meeting-content>") / 2.5) + call_config.num_predict <= call_config.num_ctx
+
+
+def test_summary_fitting_facts_keep_one_call(tmp_path: Path) -> None:
+    app, llm = _summary_app(tmp_path, ["A short fact"])
+
+    assert _process_summary(app, tmp_path) == "Partial Summary.\n"
+    assert sum(instructions.startswith("Write") for instructions in llm.instructions) == 1
+    assert SUMMARY_COMBINE not in llm.instructions
+    summary_index = next(
+        index for index, instructions in enumerate(llm.instructions)
+        if instructions.startswith("Write")
+    )
+    expected_facts = {section.value: [] for section in FACT_SECTIONS}
+    expected_facts["discussion_points"] = [
+        {"statement": "A short fact", "evidence": ["s0001"]}
+    ]
+    assert llm.instructions[summary_index] == app.prompt_settings.stage_prompt("summary")
+    assert llm.contents[summary_index] == json.dumps(expected_facts, ensure_ascii=False)
+
+
+def test_summary_combines_partial_summaries_in_multiple_passes(tmp_path: Path) -> None:
+    app, llm = _summary_app(tmp_path, [f"Fact {index} " + "x" * 100 for index in range(60)])
+
+    assert _process_summary(app, tmp_path) == "Combined Summary.\n"
+    assert sum(instructions == SUMMARY_COMBINE for instructions in llm.instructions) > 1
+    for instructions, content, call_config in zip(llm.instructions, llm.contents, llm.configs):
+        if instructions == SUMMARY_COMBINE:
+            assert math.ceil(len(instructions + "\n<meeting-content>\n" + content + "\n</meeting-content>") / 2.5) + call_config.num_predict <= call_config.num_ctx
+
+
+def test_summary_rejects_single_oversized_fact_without_content(tmp_path: Path) -> None:
+    statement = "private-meeting-content-" + "x" * 1000
+    app, _llm = _summary_app(tmp_path, [statement])
+
+    with pytest.raises(ValueError, match="^Single fact entry exceeds configured LLM token budget$") as error:
+        _process_summary(app, tmp_path)
+    assert statement not in str(error.value)
+    assert app.last_failure_reason is not None
+    assert app.last_failure_reason.startswith("summary: ValueError")
+
+
+def test_summary_stops_when_combine_groups_cannot_shrink(tmp_path: Path) -> None:
+    app, llm = _summary_app(
+        tmp_path,
+        [f"Fact {index} " + "x" * 100 for index in range(12)],
+        partial_summary="x" * 200,
+    )
+
+    with pytest.raises(ValueError, match="Partial Summaries cannot be combined"):
+        _process_summary(app, tmp_path)
+    assert SUMMARY_COMBINE not in llm.instructions
+    assert app.last_failure_reason == "summary: ValueError"
 
 
 def test_direct_provenance_references_supplied_transcript_and_stage_vocabulary(

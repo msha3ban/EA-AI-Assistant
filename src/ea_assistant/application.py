@@ -16,7 +16,7 @@ from .adapters import LLM, Audio, RetryableLLMResponseError, Sensors, SpeechToTe
 from .config import AppConfig
 from .domain import StageName
 from .models import Meeting, MeetingResult, Mom, Provenance, Segment
-from .prompts import PROMPT_VERSION, PromptSettings
+from .prompts import PROMPT_VERSION, SUMMARY_COMBINE, PromptSettings
 from .render import mom_markdown, reconcile, transcript_markdown
 from .schemas import FACT_SCHEMA, english_transcript_schema, validate_object
 from .storage import Store
@@ -315,10 +315,9 @@ class Application:
             if summary is None:
                 raise RuntimeError("Summary artefact content is missing from SQLite")
         else:
-            content = json.dumps(facts_by_section, ensure_ascii=False)
             summary = (
                 self._run_llm_stage(
-                    StageName.SUMMARY, lambda: self._summary_call(content)
+                    StageName.SUMMARY, lambda: self._summarise(facts_by_section)
                 ).strip()
                 + "\n"
             )
@@ -341,10 +340,77 @@ class Application:
             self.store.mark_stage_complete(meeting.id, StageName.MOM)
         return self.read_meeting(meeting)
 
-    def _summary_call(self, content: str) -> str:
+    def _summarise(self, facts_by_section: dict[str, list[dict[str, Any]]]) -> str:
+        instructions = self.prompt_settings.stage_prompt("summary")
+        content = json.dumps(facts_by_section, ensure_ascii=False)
+        max_chars = self._max_content_chars(instructions, StageName.SUMMARY)
+        if len(content) <= max_chars:
+            return self._summary_call(content)
+
+        chunks: list[dict[str, list[dict[str, Any]]]] = []
+        current: dict[str, list[dict[str, Any]]] = {}
+        for section, entries in facts_by_section.items():
+            for entry in entries:
+                one = {section: [entry]}
+                if len(json.dumps(one, ensure_ascii=False)) > max_chars:
+                    raise ValueError(
+                        "Single fact entry exceeds configured LLM token budget"
+                    )
+                trial = {key: list(value) for key, value in current.items()}
+                trial.setdefault(section, []).append(entry)
+                if current and len(json.dumps(trial, ensure_ascii=False)) > max_chars:
+                    chunks.append(current)
+                    current = one
+                else:
+                    current = trial
+        if current:
+            chunks.append(current)
+        if not chunks:
+            raise ValueError("Reconciled facts exceed configured LLM token budget")
+
+        partials = [
+            self._summary_call(json.dumps(chunk, ensure_ascii=False))
+            for chunk in chunks
+        ]
+        combine_max_chars = self._max_content_chars(SUMMARY_COMBINE, StageName.SUMMARY)
+        while len(partials) > 1:
+            groups: list[list[str]] = []
+            group: list[str] = []
+            for partial in partials:
+                if len(json.dumps([partial], ensure_ascii=False)) > combine_max_chars:
+                    raise ValueError(
+                        "Single partial Summary exceeds configured LLM token budget"
+                    )
+                trial_group = group + [partial]
+                if (
+                    group
+                    and len(json.dumps(trial_group, ensure_ascii=False))
+                    > combine_max_chars
+                ):
+                    groups.append(group)
+                    group = [partial]
+                else:
+                    group = trial_group
+            if group:
+                groups.append(group)
+            if len(groups) >= len(partials):
+                raise ValueError(
+                    "Partial Summaries cannot be combined within configured LLM token budget"
+                )
+            partials = [
+                self._summary_call(
+                    json.dumps(group, ensure_ascii=False), SUMMARY_COMBINE
+                )
+                if len(group) > 1
+                else group[0]
+                for group in groups
+            ]
+        return partials[0]
+
+    def _summary_call(self, content: str, instructions: str | None = None) -> str:
         self.guard.check()
         return self.llm.chat(
-            self.prompt_settings.stage_prompt("summary"),
+            instructions or self.prompt_settings.stage_prompt("summary"),
             content,
             self.config.llm.summary.adapter_values(self.config.llm.model),
         )
@@ -456,10 +522,7 @@ class Application:
     def _chunks(
         self, items: list[Any], instructions: str, stage: StageName
     ) -> list[list[Any]]:
-        config = self.config.llm.stage(stage)
-        max_chars = (
-            (config.num_ctx - config.num_predict) * 2.5 - len(instructions) - 100
-        )
+        max_chars = self._max_content_chars(instructions, stage)
         chunks: list[list[Any]] = []
         current: list[Any] = []
         for item in items:
@@ -486,3 +549,7 @@ class Application:
         if current:
             chunks.append(current)
         return chunks
+
+    def _max_content_chars(self, instructions: str, stage: StageName) -> float:
+        config = self.config.llm.stage(stage)
+        return (config.num_ctx - config.num_predict) * 2.5 - len(instructions) - 100
