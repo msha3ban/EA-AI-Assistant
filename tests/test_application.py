@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from dataclasses import replace
 from datetime import date
@@ -5,7 +6,9 @@ from pathlib import Path
 
 from ea_assistant.application import Application
 from ea_assistant.config import AppConfig, load_config
-from ea_assistant.models import Segment
+from ea_assistant.domain import Pipeline, VocabularyPromptMode
+from ea_assistant.models import Segment, VocabularyTerm
+from ea_assistant.prompts import PromptSettings
 from ea_assistant.testing import FakeAudio, FakeLLM, FakeSensors, FakeSpeechToText
 
 
@@ -77,3 +80,35 @@ def test_thermal_guard_stops_before_transcription(tmp_path: Path) -> None:
         assert "temperature unavailable" in str(exc)
     else:
         raise AssertionError("expected thermal stop")
+
+
+def test_direct_provenance_references_supplied_transcript_and_stage_vocabulary(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "recording.wav"
+    recording.write_bytes(b"audio")
+    reference = "مرحبا Kafka"
+    settings = PromptSettings(
+        pipeline=Pipeline.DIRECT,
+        vocabulary=(VocabularyTerm("Kafka", ("كافكا",)),),
+        vocabulary_prompt=VocabularyPromptMode.HOTWORDS,
+        input_digest=hashlib.sha256(reference.encode()).hexdigest(),
+    )
+    app = Application(
+        FakeAudio(),
+        FakeSpeechToText(),
+        FakeLLM(),
+        FakeSensors(),
+        config(tmp_path / "data"),
+        prompt_settings=settings,
+    )
+    meeting = app.create_meeting(str(recording), "T", date(2026, 10, 1))
+    result = app.process_transcript(meeting, [Segment("s0001", 0, 1, reference)], 1.0)
+    assert "english_transcript" not in result.provenance
+    assert result.provenance["summary"].input_revisions == {}
+    assert result.provenance["mom"].input_revisions == {}
+    assert result.provenance["summary"].input_digests == {
+        "reference_transcript": hashlib.sha256(reference.encode()).hexdigest()
+    }
+    assert result.provenance["transcript"].vocabulary == []
+    assert result.provenance["summary"].vocabulary == ["Kafka (aliases: كافكا)"]

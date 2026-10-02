@@ -12,14 +12,22 @@ from .models import Segment
 class FakeAudio:
     def __init__(self) -> None:
         self.probed: list[str] = []
+        self.normalized: list[tuple[str, str, str | None, str | None]] = []
 
     def probe(self, path: str) -> float:
         self.probed.append(path)
         return 3.0
 
-    def normalize(self, path: str, output: str) -> None:
+    def normalize(
+        self,
+        path: str,
+        output: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> None:
         from pathlib import Path
 
+        self.normalized.append((path, output, start, end))
         Path(output).write_bytes(b"fake wav")
 
 
@@ -41,7 +49,10 @@ class FakeSpeechToText:
         self.segments = segments or [Segment("s0001", 0, 1, "مرحبا", -0.1, 0.01, 1.0)]
         self.events = events if events is not None else []
         self.calls = 0
+        self.configs: list[STTConfig] = []
         self.model_identifier = "fake-stt-revision"
+        self.detected_language: str | None = "ar"
+        self.language_probability: float | None = 0.97
 
     def validate_compute_type(self, config: STTConfig) -> None:
         if config.compute_type not in {"int8", "int8_float32", "float32"}:
@@ -52,6 +63,7 @@ class FakeSpeechToText:
     ) -> tuple[list[Segment], str, str]:
         self.events.append("stt-load")
         self.calls += 1
+        self.configs.append(config)
         return self.segments, config.model, config.compute_type
 
     def release(self) -> None:
@@ -66,6 +78,7 @@ class FakeLLM:
     ) -> None:
         self.events = events if events is not None else []
         self.calls = 0
+        self.instructions: list[str] = []
         self.english_transcript_calls = 0
         self.extract_calls = 0
         self.responder = responder
@@ -89,6 +102,7 @@ class FakeLLM:
             self.loaded = True
         self.events.append("llm-call")
         self.calls += 1
+        self.instructions.append(instructions)
         obj = json.loads(content) if content.startswith("{") else {}
         if instructions.startswith("Translate"):
             self.english_transcript_calls += 1

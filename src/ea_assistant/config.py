@@ -30,6 +30,8 @@ class STTConfig:
         default_factory=lambda: DEFAULT_VAD_PARAMETERS.copy()
     )
     download_root: str | None = None
+    initial_prompt: str | None = None
+    hotwords: str | None = None
 
     def adapter_values(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,6 +44,7 @@ class LLMCallConfig:
     num_predict: int
     think: bool = False
     temperature: float = 0.0
+    timeout: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -50,10 +53,16 @@ class StageConfig:
     num_predict: int
     think: bool = False
     temperature: float = 0.0
+    timeout: float = 120.0
 
     def adapter_values(self, model: str) -> LLMCallConfig:
         return LLMCallConfig(
-            model, self.num_ctx, self.num_predict, self.think, self.temperature
+            model,
+            self.num_ctx,
+            self.num_predict,
+            self.think,
+            self.temperature,
+            self.timeout,
         )
 
 
@@ -62,9 +71,15 @@ class LLMConfig:
     endpoint: str = "http://127.0.0.1:11434"
     model: str = "qwen3:8b"
     timeout: float = 120
-    translate: StageConfig = field(default_factory=lambda: StageConfig(8192, 4096))
-    extract: StageConfig = field(default_factory=lambda: StageConfig(8192, 4096))
-    summary: StageConfig = field(default_factory=lambda: StageConfig(4096, 512))
+    translate: StageConfig = field(
+        default_factory=lambda: StageConfig(8192, 4096, timeout=600)
+    )
+    extract: StageConfig = field(
+        default_factory=lambda: StageConfig(8192, 4096, timeout=600)
+    )
+    summary: StageConfig = field(
+        default_factory=lambda: StageConfig(4096, 512, timeout=300)
+    )
     unload_timeout: float = 15.0
     unload_poll_interval: float = 0.25
 

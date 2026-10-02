@@ -8,7 +8,13 @@ from .models import Segment
 
 class Audio(Protocol):
     def probe(self, path: str) -> float: ...
-    def normalize(self, path: str, output: str) -> None: ...
+    def normalize(
+        self,
+        path: str,
+        output: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> None: ...
 
 
 class SpeechToText(Protocol):

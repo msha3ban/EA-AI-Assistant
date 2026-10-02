@@ -1,0 +1,13 @@
+name = "invented-demo"
+recording = "demo.wav"
+reference_transcript = "reference.txt"
+critical_facts = "facts.toml"
+vocabulary = "vocabulary.toml"
+output_dir = "results"
+
+[[run]]
+name = "direct-demo"
+pipeline = "direct"
+vocabulary_prompt = "initial_prompt"
+[run.llm]
+model = "qwen3:8b"

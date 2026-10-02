@@ -12,6 +12,25 @@ class StageName(StrEnum):
     MOM = "mom"
 
 
+class Pipeline(StrEnum):
+    TWO_STEP = "two-step"
+    DIRECT = "direct"
+
+
+class VocabularyPromptMode(StrEnum):
+    OFF = "off"
+    INITIAL_PROMPT = "initial_prompt"
+    HOTWORDS = "hotwords"
+
+
+class FactKind(StrEnum):
+    DECISION = "decision"
+    ACTION_ITEM = "action_item"
+    TECHNICAL_DETAIL = "technical_detail"
+    DATE = "date"
+    NUMBER = "number"
+
+
 class MomState(StrEnum):
     DRAFT = "Draft"
 

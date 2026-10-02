@@ -96,6 +96,26 @@ def test_ollama_chat_does_not_unload_each_call_and_uses_get_for_ps() -> None:
     assert client.models["m"] == "sha256:abc"
 
 
+def test_ollama_stage_timeout_is_passed_to_transport() -> None:
+    assert AppConfig().llm.translate.timeout == 600
+    assert AppConfig().llm.extract.timeout == 600
+    assert AppConfig().llm.summary.timeout == 300
+    observed: list[float] = []
+
+    def transport(method: str, url: str, data: bytes | None, timeout: float) -> bytes:
+        observed.append(timeout)
+        if url.endswith("/api/tags"):
+            return b'{"models":[{"name":"m","digest":"d"}]}'
+        if url.endswith("/api/chat"):
+            raise TimeoutError("transport timed out")
+        return b"{}"
+
+    client = OllamaClient("http://127.0.0.1:11434", timeout=120, transport=transport)
+    with pytest.raises(TimeoutError):
+        client.chat("rules", "content", LLMCallConfig("m", 500, 20, timeout=600))
+    assert observed == [120, 600]
+
+
 def test_faster_whisper_receives_decoded_samples_not_a_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
