@@ -100,6 +100,8 @@ def test_ollama_stage_timeout_is_passed_to_transport() -> None:
     assert AppConfig().llm.translate.timeout == 600
     assert AppConfig().llm.extract.timeout == 600
     assert AppConfig().llm.summary.timeout == 300
+    assert AppConfig().llm.summary.num_ctx == 8192
+    assert AppConfig().llm.summary.num_predict == 512
     observed: list[float] = []
 
     def transport(method: str, url: str, data: bytes | None, timeout: float) -> bytes:

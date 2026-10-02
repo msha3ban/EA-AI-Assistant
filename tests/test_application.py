@@ -67,6 +67,28 @@ def test_detection_flags_segments(tmp_path: Path) -> None:
     assert "repetition loop" in transcript and "likely text over silence" in transcript
 
 
+def test_default_vocabulary_prompt_reaches_stt_for_normal_processing(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "r.m4a"
+    recording.write_bytes(b"r")
+    stt = FakeSpeechToText()
+    app = Application(
+        FakeAudio(),
+        stt,
+        FakeLLM(),
+        FakeSensors(),
+        config(tmp_path / "data"),
+        prompt_settings=PromptSettings(
+            vocabulary=(VocabularyTerm("Kafka", ("كافكا",)),)
+        ),
+    )
+    meeting = app.create_meeting(str(recording), "T", date(2026, 10, 1))
+    app.process(meeting)
+    assert stt.configs[0].hotwords == "Kafka"
+    assert stt.configs[0].initial_prompt is None
+
+
 def test_thermal_guard_stops_before_transcription(tmp_path: Path) -> None:
     recording = tmp_path / "r.m4a"
     recording.write_bytes(b"r")

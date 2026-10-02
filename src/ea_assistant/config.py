@@ -78,7 +78,7 @@ class LLMConfig:
         default_factory=lambda: StageConfig(8192, 4096, timeout=600)
     )
     summary: StageConfig = field(
-        default_factory=lambda: StageConfig(4096, 512, timeout=300)
+        default_factory=lambda: StageConfig(8192, 512, timeout=300)
     )
     unload_timeout: float = 15.0
     unload_poll_interval: float = 0.25

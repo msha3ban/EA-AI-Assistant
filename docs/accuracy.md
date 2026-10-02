@@ -10,7 +10,11 @@ When a later MoM stage fails after the Transcript was produced, the run remains 
 
 Use `ea accuracy /absolute/path/to/suite.toml --config /absolute/path/to/app-config.toml --out /absolute/path/to/results` to choose an external results directory. Omit `--config` to use the normal application config; omit `--out` to use the suite's `output_dir` (default `results` beside the suite). Repeat configurations with multiple `[[run]]` entries, or pass `--only name-a name-b` to run a subset. A Vocabulary `initial_prompt` is conservatively kept at no more than 224 UTF-8 bytes, a safe upper bound for Whisper's 224-token prompt limit; the report records whether terms were truncated.
 
+An omitted suite `vocabulary_prompt` means `off`, independently of the normal processing default of `hotwords`.
+
 Ticket #1 should compare MoM critical-fact accuracy and Flagged Passage recall alongside WER, rather than selecting a model on WER alone. A low WER can still omit or reverse an important Decision, while a higher WER may preserve all critical facts. Review the artifact files and invented candidates before choosing settings. `direct` runs extract and render from the corrected mixed-language reference Transcript; `two-step` also runs speech-to-text and English Transcript generation.
+
+The completed evaluation and selected application defaults are recorded in [accuracy-results.md](accuracy-results.md).
 
 Reference files stay outside the repository. Results are written beneath the configured output directory; the CLI refuses output paths inside this repository. For the checked-in invented example only, pass `--allow-suite-in-repo` and set `--out` to a directory outside the checkout.
 

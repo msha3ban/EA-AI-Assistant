@@ -18,7 +18,7 @@ WHISPER_PROMPT_TOKEN_LIMIT = 224  # Enforced as a conservative UTF-8 byte limit.
 class PromptSettings:
     pipeline: Pipeline = Pipeline.TWO_STEP
     vocabulary: tuple[VocabularyTerm, ...] = ()
-    vocabulary_prompt: VocabularyPromptMode = VocabularyPromptMode.OFF
+    vocabulary_prompt: VocabularyPromptMode = VocabularyPromptMode.HOTWORDS
     input_digest: str | None = None
 
     @property

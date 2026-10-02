@@ -30,7 +30,7 @@ from ea_assistant.accuracy.suite import Suite, SuiteRun, load_suite, merge_confi
 from ea_assistant.adapters import RetryableLLMResponseError
 from ea_assistant.application import Application
 from ea_assistant.config import AppConfig
-from ea_assistant.domain import FACT_SECTIONS
+from ea_assistant.domain import FACT_SECTIONS, VocabularyPromptMode
 from ea_assistant.models import Segment
 from ea_assistant.prompts import PromptSettings
 from ea_assistant.testing import FakeAudio, FakeLLM, FakeSensors, FakeSpeechToText
@@ -341,6 +341,7 @@ def test_suite_relative_paths_merge_and_unknown_rejected(tmp_path: Path) -> None
     )
     suite = load_suite(path)
     assert isinstance(suite, Suite) and isinstance(suite.run[0], SuiteRun)
+    assert suite.run[0].vocabulary_prompt is VocabularyPromptMode.OFF
     assert suite["recording"] == str((tmp_path / "recording.wav").resolve())
     cfg = merge_config(AppConfig(), suite["run"][0], tmp_path / "data")
     assert cfg.stt.language == "auto" and cfg.llm.extract.num_predict == 123
