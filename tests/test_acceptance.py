@@ -407,6 +407,9 @@ def test_ffmpeg_audio_contract_3s_m4a_to_16khz_mono(tmp_path: Path) -> None:
     with wave.open(str(wav), "rb") as f:
         assert f.getframerate() == 16000 and f.getnchannels() == 1
     assert 2.9 <= duration <= 3.1
+    excerpt = tmp_path / "excerpt.wav"
+    audio.normalize(str(recording_path), str(excerpt), "00:01", "00:02")
+    assert 0.9 <= audio.probe(str(excerpt)) <= 1.1
 
 
 def test_faster_whisper_contract_is_lazy_local_and_released(
@@ -431,7 +434,8 @@ def test_faster_whisper_contract_is_lazy_local_and_released(
             observed["transcribe"] = kwargs
 
             class Info:
-                pass
+                language = "ar"
+                language_probability = 0.97
 
             class Item:
                 start = 0.0
@@ -498,7 +502,15 @@ def test_faster_whisper_contract_is_lazy_local_and_released(
         and compute_type == "int8_float32"
     )
     assert adapter.model_identifier == "revision-123"
+    assert adapter.detected_language == "ar"
+    assert adapter.language_probability == 0.97
     assert observed["download_args"] == {"local_files_only": True, "cache_dir": None}
+    prompt_config = STTConfig(
+        model="large-v3", initial_prompt="SAP S/4HANA", hotwords="Kafka"
+    )
+    adapter.transcribe(str(local_wav), prompt_config)
+    assert observed["transcribe"]["initial_prompt"] == "SAP S/4HANA"
+    assert observed["transcribe"]["hotwords"] == "Kafka"
 
 
 def test_chunking_both_stages_and_extract_retry(tmp_path: Path) -> None:

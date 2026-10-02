@@ -18,10 +18,14 @@ from pathlib import Path
 from .application import Application
 from .config import AppConfig, load_config
 from .ollama import OllamaClient
+from .prompts import PromptSettings
 from .real_adapters import FasterWhisper, FfmpegAudio, MachineSensors
 
 
-def build_application(config: AppConfig) -> Application:
+def build_application(
+    config: AppConfig,
+    prompt_settings: PromptSettings | None = None,
+) -> Application:
     return Application(
         FfmpegAudio(),
         FasterWhisper(),
@@ -33,6 +37,7 @@ def build_application(config: AppConfig) -> Application:
         ),
         MachineSensors(),
         config,
+        prompt_settings=prompt_settings,
     )
 
 
@@ -50,8 +55,31 @@ def main(argv: list[str] | None = None, app: Application | None = None) -> int:
     pre.add_argument("--config", default=argparse.SUPPRESS)
     setup = subs.add_parser("setup-models")
     setup.add_argument("--config", default=argparse.SUPPRESS)
+    accuracy = subs.add_parser("accuracy")
+    accuracy.add_argument("--config", default=argparse.SUPPRESS)
+    accuracy.add_argument("suite")
+    accuracy.add_argument("--only", nargs="+", default=None)
+    accuracy.add_argument("--out", default=None)
+    accuracy.add_argument("--allow-suite-in-repo", action="store_true")
     args = parser.parse_args(argv)
     config = load_config(args.config)
+    if args.command == "accuracy":
+        from .accuracy.runner import SubprocessExecutor, run_suite
+        from .accuracy.suite import load_suite
+
+        suite = load_suite(args.suite)
+        if args.out:
+            suite = replace(suite, output_dir=Path(args.out).expanduser().resolve())
+
+        run_suite(
+            suite,
+            build_application,
+            config,
+            only=args.only,
+            allow_suite_in_repo=args.allow_suite_in_repo,
+            executor=SubprocessExecutor(),
+        )
+        return 0
     if args.command == "setup-models":
         try:
             from faster_whisper import download_model

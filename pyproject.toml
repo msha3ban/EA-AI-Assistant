@@ -33,3 +33,7 @@ strict = true
 [[tool.mypy.overrides]]
 module = ["faster_whisper", "faster_whisper.*", "ctranslate2"]
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-m 'not accuracy'"
+markers = ["accuracy: opt-in real local model accuracy suite"]

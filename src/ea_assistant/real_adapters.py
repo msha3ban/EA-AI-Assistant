@@ -34,24 +34,20 @@ class FfmpegAudio:
         )
         return float(out.stdout.strip())
 
-    def normalize(self, path: str, output: str) -> None:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                path,
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-f",
-                "wav",
-                output,
-            ],
-            check=True,
-            capture_output=True,
-        )
+    def normalize(
+        self,
+        path: str,
+        output: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> None:
+        command = ["ffmpeg", "-y", "-i", path]
+        if start is not None:
+            command.extend(["-ss", start])
+        if end is not None:
+            command.extend(["-to", end])
+        command.extend(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", output])
+        subprocess.run(command, check=True, capture_output=True)
 
 
 def _preload_cuda_libraries() -> None:
@@ -107,6 +103,8 @@ def _read_normalized_wav(path: str) -> Any:
 class FasterWhisper:
     def __init__(self) -> None:
         self.model_identifier = "unknown"
+        self.detected_language: str | None = None
+        self.language_probability: float | None = None
 
     def validate_compute_type(self, config: STTConfig) -> None:
         if config.device == "cuda":
@@ -147,13 +145,24 @@ class FasterWhisper:
             local_files_only=True,
         )
         try:
-            raw, _info = model.transcribe(
+            kwargs: dict[str, Any] = {}
+            if config.initial_prompt is not None:
+                kwargs["initial_prompt"] = config.initial_prompt
+            if config.hotwords is not None:
+                kwargs["hotwords"] = config.hotwords
+            raw, info = model.transcribe(
                 audio,
                 task="transcribe",
                 language=None if config.language == "auto" else config.language,
                 beam_size=config.beam_size,
                 vad_filter=config.vad_filter,
                 vad_parameters=config.vad_parameters,
+                **kwargs,
+            )
+            self.detected_language = getattr(info, "language", None)
+            probability = getattr(info, "language_probability", None)
+            self.language_probability = (
+                float(probability) if probability is not None else None
             )
             segments = [
                 Segment(

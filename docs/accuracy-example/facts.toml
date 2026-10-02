@@ -1,0 +1,16 @@
+[[fact]]
+id = "F1"
+kind = "decision"
+statement = "Use SAP S/4HANA in the demo"
+expect = ["SAP S/4HANA", "demo"]
+anchor = ["demo"]
+wrong_if = ["Oracle"]
+
+[[fact]]
+id = "F2"
+kind = "action_item"
+statement = "Ahmed sends the file by 2026-10-15"
+expect = ["file"]
+anchor = ["file"]
+owner = "Ahmed"
+due = "2026-10-15"

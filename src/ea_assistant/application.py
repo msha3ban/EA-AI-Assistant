@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -14,7 +16,7 @@ from .adapters import LLM, Audio, Sensors, SpeechToText
 from .config import AppConfig
 from .domain import StageName
 from .models import Meeting, MeetingResult, Mom, Provenance, Segment
-from .prompts import EXTRACT, PROMPT_VERSION, SUMMARY, TRANSLATE
+from .prompts import PROMPT_VERSION, PromptSettings
 from .render import mom_markdown, reconcile, transcript_markdown
 from .schemas import FACT_SCHEMA, english_transcript_schema, validate_object
 from .storage import Store
@@ -32,9 +34,15 @@ class Application:
         llm: LLM,
         sensors: Sensors,
         config: AppConfig,
+        prompt_settings: PromptSettings | None = None,
     ) -> None:
         self.audio, self.stt, self.llm = audio, stt, llm
         self.config = config
+        self.prompt_settings = prompt_settings or PromptSettings()
+        self.last_failure_reason: str | None = None
+        self.effective_language: str | None = None
+        self.language_probability: float | None = None
+        self.effective_compute_type: str | None = None
         self.guard = ThermalGuard(sensors, config.thermal)
         self.store = Store(config.data_dir / "ea.sqlite")
 
@@ -50,7 +58,7 @@ class Application:
         folder.mkdir(parents=True)
         recording_copy = folder / recording_path.name
         shutil.copy2(recording_path, recording_copy)
-        meeting = Meeting(meeting_id, title, meeting_date, folder, topic)
+        meeting = Meeting(meeting_id, title, meeting_date, folder, topic, duration)
         self.store.create_meeting(meeting)
         self.store.add_recording(meeting.id, recording_copy, 0, duration)
         return meeting
@@ -64,9 +72,65 @@ class Application:
         normalized_path = meeting.folder / "normalized.wav"
         self._ingest(meeting, recording_path, normalized_path)
         segments = self._transcribe(meeting, normalized_path)
-        english = self._translate(meeting, segments)
+        return self._run_stage_sequence(meeting, duration, segments)
+
+    def process_pre_normalized(
+        self, meeting: Meeting, normalized_path: str | Path
+    ) -> MeetingResult:
+        """Run all AI stages on a normalized Recording prepared by the caller."""
+        self.stt.validate_compute_type(self.config.stt)
+        recordings = self.store.recordings(meeting.id)
+        if not recordings:
+            raise ValueError(f"Meeting {meeting.id} has no Recording")
+        _, duration = recordings[0]
+        self.store.mark_stage_complete(meeting.id, StageName.INGEST)
+        segments = self._transcribe(meeting, Path(normalized_path))
+        return self._run_stage_sequence(meeting, duration, segments)
+
+    def process_transcript(
+        self, meeting: Meeting, segments: list[Segment], duration: float
+    ) -> MeetingResult:
+        """Generate a Summary and MoM from supplied mixed-language Transcript segments."""
+        digest = (
+            self.prompt_settings.input_digest
+            or hashlib.sha256(
+                "\n".join(item.text for item in segments).encode("utf-8")
+            ).hexdigest()
+        )
+        self.store.save_segments(meeting.id, segments)
+        self._publish(
+            meeting,
+            "transcript",
+            meeting.folder / "transcript.md",
+            transcript_markdown(segments),
+            Provenance(
+                prompt_version=PROMPT_VERSION,
+                prompt_variant=self.prompt_settings.prompt_variant,
+                vocabulary=self.prompt_settings.vocabulary_snapshot("transcript"),
+            ),
+        )
+        self.store.mark_stage_complete(meeting.id, StageName.TRANSCRIBE)
+        return self._run_stage_sequence(
+            meeting, duration, segments, direct=True, input_digest=digest
+        )
+
+    def _run_stage_sequence(
+        self,
+        meeting: Meeting,
+        duration: float,
+        segments: list[Segment],
+        direct: bool = False,
+        input_digest: str | None = None,
+    ) -> MeetingResult:
+        english = (
+            {item.id: item.text for item in segments}
+            if direct
+            else self._translate(meeting, segments)
+        )
         facts = self._extract(meeting, segments, english)
-        return self._render(meeting, duration, segments, facts)
+        return self._render(
+            meeting, duration, segments, facts, direct=direct, input_digest=input_digest
+        )
 
     def read_meeting(self, meeting: Meeting) -> MeetingResult:
         def read(name: str) -> str:
@@ -80,6 +144,11 @@ class Application:
             read("summary.md"),
             Mom(read("mom.md")),
             self.store.provenance(meeting.id),
+            self.effective_language,
+            self.language_probability,
+            self.effective_compute_type,
+            self.store.segments(meeting.id),
+            meeting.duration,
         )
 
     def _ingest(
@@ -96,10 +165,21 @@ class Application:
             return self.store.segments(meeting.id)
         self.guard.check()
         self.llm.ensure_gpu_free()
+        stt_values: dict[str, Any] = {
+            key: value
+            for key, value in self.prompt_settings.stt_prompt_values().items()
+            if value is not None
+        }
+        stt_config = replace(self.config.stt, **stt_values)
         try:
             segments, stt_model, compute_type = self.stt.transcribe(
-                str(normalized_path), self.config.stt
+                str(normalized_path), stt_config
             )
+            self.effective_language = (
+                getattr(self.stt, "detected_language", None) or self.config.stt.language
+            )
+            self.language_probability = getattr(self.stt, "language_probability", None)
+            self.effective_compute_type = compute_type
         finally:
             self.stt.release()
         for segment in segments:
@@ -115,6 +195,8 @@ class Application:
                 compute_type=compute_type,
                 prompt_version=PROMPT_VERSION,
                 decoding=self.config.stt.adapter_values(),
+                prompt_variant=self.prompt_settings.prompt_variant,
+                vocabulary=self.prompt_settings.vocabulary_snapshot("transcript"),
             ),
         )
         self.store.mark_stage_complete(meeting.id, StageName.TRANSCRIBE)
@@ -135,7 +217,8 @@ class Application:
 
         def run() -> dict[str, str]:
             english: dict[str, str] = {}
-            chunks = self._chunks(segments, TRANSLATE, StageName.TRANSLATE)
+            instructions = self.prompt_settings.stage_prompt("translate")
+            chunks = self._chunks(segments, instructions, StageName.TRANSLATE)
             for chunk in chunks:
                 self.guard.check()
                 ids = [segment.id for segment in chunk]
@@ -152,7 +235,7 @@ class Application:
                     ) == set(expected_ids)
 
                 value = self._json_call(
-                    TRANSLATE,
+                    instructions,
                     content,
                     StageName.TRANSLATE,
                     schema,
@@ -185,16 +268,17 @@ class Application:
 
         def run() -> list[dict[str, Any]]:
             all_facts = []
+            instructions = self.prompt_settings.stage_prompt("extract")
             chunks = self._chunks(
                 [(segment.id, english[segment.id]) for segment in segments],
-                EXTRACT,
+                instructions,
                 StageName.EXTRACT,
             )
             for index, chunk in enumerate(chunks):
                 self.guard.check()
                 content = {segment_id: text for segment_id, text in chunk}
                 value = self._json_call(
-                    EXTRACT,
+                    instructions,
                     content,
                     StageName.EXTRACT,
                     FACT_SCHEMA,
@@ -214,11 +298,18 @@ class Application:
         duration: float,
         segments: list[Segment],
         facts: list[dict[str, Any]],
+        direct: bool = False,
+        input_digest: str | None = None,
     ) -> MeetingResult:
         facts_by_section = reconcile(facts, segments)
-        english_revision = self.store.artefact_revision(
-            meeting.id, "english_transcript"
+        english_revision = (
+            None
+            if direct
+            else self.store.artefact_revision(meeting.id, "english_transcript")
         )
+        input_refs: dict[str, int] = {}
+        if not direct and english_revision is not None:
+            input_refs["english_transcript"] = english_revision
         if self.store.is_stage_complete(meeting.id, StageName.SUMMARY):
             summary = self.store.artefact_content(meeting.id, "summary")
             if summary is None:
@@ -236,16 +327,14 @@ class Application:
                 "summary",
                 meeting.folder / "summary.md",
                 summary,
-                self._llm_provenance(
-                    StageName.SUMMARY, {"english_transcript": english_revision}
-                ),
+                self._llm_provenance(StageName.SUMMARY, input_refs, input_digest),
             )
             self.store.mark_stage_complete(meeting.id, StageName.SUMMARY)
         if not self.store.is_stage_complete(meeting.id, StageName.MOM):
             mom_text = mom_markdown(
                 meeting, duration, summary.strip(), facts_by_section
             )
-            provenance = self._mom_provenance(english_revision)
+            provenance = self._mom_provenance(input_refs, input_digest)
             self._publish(
                 meeting, "mom", meeting.folder / "mom.md", mom_text, provenance
             )
@@ -255,37 +344,57 @@ class Application:
     def _summary_call(self, content: str) -> str:
         self.guard.check()
         return self.llm.chat(
-            SUMMARY,
+            self.prompt_settings.stage_prompt("summary"),
             content,
             self.config.llm.summary.adapter_values(self.config.llm.model),
         )
 
-    def _mom_provenance(self, english_revision: int) -> Provenance:
+    def _mom_provenance(
+        self, input_revisions: dict[str, int], input_digest: str | None
+    ) -> Provenance:
         model = self.config.llm.model
         digest = self.llm.model_digest(model)
         return Provenance(
             models={model: {"digest": digest}},
             prompt_version=PROMPT_VERSION,
+            prompt_variant=self.prompt_settings.prompt_variant,
             decoding={
                 "extract": self.config.llm.extract.adapter_values(model),
                 "summary": self.config.llm.summary.adapter_values(model),
             },
-            input_revisions={"english_transcript": english_revision},
+            vocabulary=self.prompt_settings.vocabulary_snapshot("summary"),
+            input_revisions=input_revisions,
+            input_digests={"reference_transcript": input_digest}
+            if input_digest
+            else {},
         )
 
-    def _llm_provenance(self, stage: StageName, inputs: dict[str, int]) -> Provenance:
+    def _llm_provenance(
+        self, stage: StageName, inputs: dict[str, int], input_digest: str | None = None
+    ) -> Provenance:
         model = self.config.llm.model
         return Provenance(
             models={model: {"digest": self.llm.model_digest(model)}},
             prompt_version=PROMPT_VERSION,
+            prompt_variant=self.prompt_settings.prompt_variant,
             decoding=self.config.llm.stage(stage).adapter_values(model).__dict__,
+            vocabulary=self.prompt_settings.vocabulary_snapshot(stage.value),
             input_revisions=inputs,
+            input_digests={"reference_transcript": input_digest}
+            if input_digest
+            else {},
         )
 
     def _run_llm_stage(self, stage: StageName, operation: Callable[[], T]) -> T:
         try:
             result = operation()
         except Exception as stage_error:
+            timeout = self.config.llm.stage(stage).timeout
+            self.last_failure_reason = (
+                f"{stage.value}: TimeoutError after {timeout:g} s"
+                if isinstance(stage_error, TimeoutError)
+                else f"{stage.value}: {type(stage_error).__name__}"
+            )
             try:
                 self.llm.unload(self.config.llm.model)
             except Exception as unload_error:

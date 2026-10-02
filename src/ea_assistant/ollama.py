@@ -42,13 +42,17 @@ class OllamaClient:
             return bytes(response.read())
 
     def _call(
-        self, method: str, path: str, data: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        data: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         raw = self.transport(
             method,
             self.endpoint + path,
             json.dumps(data).encode() if data is not None else None,
-            self.timeout,
+            self.timeout if timeout is None else timeout,
         )
         value: Any = json.loads(raw)
         if not isinstance(value, dict):
@@ -103,7 +107,7 @@ class OllamaClient:
         }
         if schema is not None:
             payload["format"] = schema
-        result = self._call("POST", "/api/chat", payload)
+        result = self._call("POST", "/api/chat", payload, timeout=config.timeout)
         message = result.get("message", {})
         text = message.get("content", "")
         prompt_count = result.get("prompt_eval_count")
