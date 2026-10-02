@@ -47,6 +47,8 @@ class PromptSettings:
             prompt = DIRECT_EXTRACT if self.pipeline is Pipeline.DIRECT else EXTRACT
         elif stage == "summary":
             prompt = SUMMARY
+        elif stage == "summary_combine":
+            prompt = SUMMARY_COMBINE
         else:
             raise ValueError(f"Unknown prompt stage {stage!r}")
         if self.llm_vocabulary:

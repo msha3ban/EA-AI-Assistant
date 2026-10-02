@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -16,7 +16,7 @@ from .adapters import LLM, Audio, RetryableLLMResponseError, Sensors, SpeechToTe
 from .config import AppConfig
 from .domain import StageName
 from .models import Meeting, MeetingResult, Mom, Provenance, Segment
-from .prompts import PROMPT_VERSION, SUMMARY_COMBINE, PromptSettings
+from .prompts import PROMPT_VERSION, PromptSettings
 from .render import mom_markdown, reconcile, transcript_markdown
 from .schemas import FACT_SCHEMA, english_transcript_schema, validate_object
 from .storage import Store
@@ -343,74 +343,70 @@ class Application:
     def _summarise(self, facts_by_section: dict[str, list[dict[str, Any]]]) -> str:
         instructions = self.prompt_settings.stage_prompt("summary")
         content = json.dumps(facts_by_section, ensure_ascii=False)
-        max_chars = self._max_content_chars(instructions, StageName.SUMMARY)
-        if len(content) <= max_chars:
-            return self._summary_call(content)
+        if len(content) <= self._max_content_chars(instructions, StageName.SUMMARY):
+            return self._summary_call(content, instructions)
 
-        chunks: list[dict[str, list[dict[str, Any]]]] = []
-        current: dict[str, list[dict[str, Any]]] = {}
-        for section, entries in facts_by_section.items():
-            for entry in entries:
-                one = {section: [entry]}
-                if len(json.dumps(one, ensure_ascii=False)) > max_chars:
-                    raise ValueError(
-                        "Single fact entry exceeds configured LLM token budget"
-                    )
-                trial = {key: list(value) for key, value in current.items()}
-                trial.setdefault(section, []).append(entry)
-                if current and len(json.dumps(trial, ensure_ascii=False)) > max_chars:
-                    chunks.append(current)
-                    current = one
-                else:
-                    current = trial
-        if current:
-            chunks.append(current)
-        if not chunks:
-            raise ValueError("Reconciled facts exceed configured LLM token budget")
-
+        fact_chunks = self._chunk_facts(facts_by_section, instructions)
         partials = [
-            self._summary_call(json.dumps(chunk, ensure_ascii=False))
-            for chunk in chunks
+            self._summary_call(json.dumps(chunk, ensure_ascii=False), instructions)
+            for chunk in fact_chunks
         ]
-        combine_max_chars = self._max_content_chars(SUMMARY_COMBINE, StageName.SUMMARY)
+        return self._combine_summaries(partials)
+
+    def _chunk_facts(
+        self, facts_by_section: dict[str, list[dict[str, Any]]], instructions: str
+    ) -> list[dict[str, list[dict[str, Any]]]]:
+        def fact_payload(
+            facts: list[tuple[str, dict[str, Any]]],
+        ) -> dict[str, list[dict[str, Any]]]:
+            by_section: dict[str, list[dict[str, Any]]] = {}
+            for section, entry in facts:
+                by_section.setdefault(section, []).append(entry)
+            return by_section
+
+        entries = (
+            (section, entry)
+            for section, section_entries in facts_by_section.items()
+            for entry in section_entries
+        )
+        chunks = self._pack_items(
+            entries,
+            self._max_content_chars(instructions, StageName.SUMMARY),
+            fact_payload,
+            lambda _entry: "Single fact entry exceeds configured LLM token budget",
+        )
+        return [fact_payload(chunk) for chunk in chunks]
+
+    def _combine_summaries(self, partials: list[str]) -> str:
+        instructions = self.prompt_settings.stage_prompt("summary_combine")
+        max_chars = self._max_content_chars(instructions, StageName.SUMMARY)
         while len(partials) > 1:
-            groups: list[list[str]] = []
-            group: list[str] = []
-            for partial in partials:
-                if len(json.dumps([partial], ensure_ascii=False)) > combine_max_chars:
-                    raise ValueError(
-                        "Single partial Summary exceeds configured LLM token budget"
-                    )
-                trial_group = group + [partial]
-                if (
-                    group
-                    and len(json.dumps(trial_group, ensure_ascii=False))
-                    > combine_max_chars
-                ):
-                    groups.append(group)
-                    group = [partial]
-                else:
-                    group = trial_group
-            if group:
-                groups.append(group)
+            groups = self._pack_items(
+                partials,
+                max_chars,
+                lambda summaries: summaries,
+                lambda _summary: (
+                    "Single partial Summary exceeds configured LLM token budget"
+                ),
+            )
             if len(groups) >= len(partials):
                 raise ValueError(
                     "Partial Summaries cannot be combined within configured LLM token budget"
                 )
             partials = [
                 self._summary_call(
-                    json.dumps(group, ensure_ascii=False), SUMMARY_COMBINE
+                    json.dumps(summaries, ensure_ascii=False), instructions
                 )
-                if len(group) > 1
-                else group[0]
-                for group in groups
+                if len(summaries) > 1
+                else summaries[0]
+                for summaries in groups
             ]
         return partials[0]
 
-    def _summary_call(self, content: str, instructions: str | None = None) -> str:
+    def _summary_call(self, content: str, instructions: str) -> str:
         self.guard.check()
         return self.llm.chat(
-            instructions or self.prompt_settings.stage_prompt("summary"),
+            instructions,
             content,
             self.config.llm.summary.adapter_values(self.config.llm.model),
         )
@@ -522,30 +518,42 @@ class Application:
     def _chunks(
         self, items: list[Any], instructions: str, stage: StageName
     ) -> list[list[Any]]:
-        max_chars = self._max_content_chars(instructions, stage)
-        chunks: list[list[Any]] = []
-        current: list[Any] = []
+        def segment_payload(chunk: list[Any]) -> dict[str, str]:
+            return (
+                {entry.id: entry.text for entry in chunk}
+                if chunk and isinstance(chunk[0], Segment)
+                else {entry[0]: entry[1] for entry in chunk}
+            )
+
+        return self._pack_items(
+            items,
+            self._max_content_chars(instructions, stage),
+            segment_payload,
+            lambda item: (
+                f"Single segment {item.id if isinstance(item, Segment) else item[0]} "
+                "exceeds configured LLM token budget"
+            ),
+        )
+
+    def _pack_items(
+        self,
+        items: Iterable[T],
+        max_chars: float,
+        payload: Callable[[list[T]], Any],
+        oversized_message: Callable[[T], str],
+    ) -> list[list[T]]:
+        chunks: list[list[T]] = []
+        current: list[T] = []
         for item in items:
-            trial = current + [item]
-            content = (
-                {entry.id: entry.text for entry in trial}
-                if trial and isinstance(trial[0], Segment)
-                else {entry[0]: entry[1] for entry in trial}
-            )
-            if current and len(json.dumps(content, ensure_ascii=False)) > max_chars:
+            current.append(item)
+            if len(json.dumps(payload(current), ensure_ascii=False)) <= max_chars:
+                continue
+            current.pop()
+            if current:
                 chunks.append(current)
-                current = [item]
-            else:
-                current = trial
-            one = (
-                {item.id: item.text}
-                if isinstance(item, Segment)
-                else {item[0]: item[1]}
-            )
-            if len(json.dumps(one, ensure_ascii=False)) > max_chars:
-                raise ValueError(
-                    f"Single segment {next(iter(one))} exceeds configured LLM token budget"
-                )
+            current = [item]
+            if len(json.dumps(payload(current), ensure_ascii=False)) > max_chars:
+                raise ValueError(oversized_message(item))
         if current:
             chunks.append(current)
         return chunks
