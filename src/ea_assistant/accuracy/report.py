@@ -24,6 +24,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("real_error_segments", "Real error segments"),
     ("flagged_segments", "Flagged segments"),
     ("mom_found", "MoM found"),
+    ("mom_found_expected", "found in expected section"),
     ("mom_wrong", "wrong"),
     ("mom_missing", "missing"),
     ("mom_invented", "invented"),

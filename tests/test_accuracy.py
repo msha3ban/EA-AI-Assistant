@@ -233,6 +233,18 @@ def test_critical_fact_results_and_invented_candidates() -> None:
     assert "- D2: Add an unrelated cache" in result["invented"]
 
 
+def test_critical_facts_match_other_mom_sections_and_report_location() -> None:
+    result = score_facts(
+        "## Purpose / Agenda\n- Use Kafka for integration\n## Decisions\n- D1: Add cache",
+        [{"id": "F1", "kind": "decision", "statement": "Use Kafka",
+          "expect": ["kafka", "integration"], "anchor": ["integration"]}],
+    )
+    assert result["found"] == ["F1"]
+    assert result["results"][0]["section"] == "Purpose / Agenda"
+    assert result["results"][0]["in_expected_section"] is False
+    assert "- Use Kafka for integration" not in result["invented"]
+
+
 def test_critical_facts_load_as_frozen_typed_values(tmp_path: Path) -> None:
     path = tmp_path / "facts.toml"
     path.write_text(
@@ -732,3 +744,68 @@ def test_timeout_failure_names_stage_type_and_configured_duration(
     )
     assert report["runs"][0]["failure"] == "extract: TimeoutError after 600 s"
     assert "private transport detail" not in str(report)
+
+
+def test_failed_extract_keeps_transcript_metrics_and_safe_ollama_message(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "recording.wav"
+    recording.write_bytes(b"audio")
+    reference = tmp_path / "reference.txt"
+    reference.write_text("SAP S/4HANA and 123", encoding="utf-8")
+
+    def fail_extract(instructions: str, content: dict[str, str]) -> str:
+        if instructions.startswith("Extract"):
+            raise RuntimeError("Ollama returned invalid JSON")
+        if instructions.startswith("Translate"):
+            return json.dumps(content)
+        return "{}"
+
+    report = run_suite(
+        {"name": "failed", "recording": str(recording),
+         "reference_transcript": str(reference), "output_dir": str(tmp_path / "out"),
+         "run": [{"name": "r", "pipeline": "two-step"}]},
+        lambda config, settings: _make_app(
+            config, settings,
+            stt_obj=FakeSpeechToText([Segment("s1", 0, 1, "SAP S/4HANA and 123")]),
+            llm_obj=FakeLLM(responder=fail_extract),
+        ), sampler=FakeSampler(), audio_preparer=FakeAudio(),
+    )
+    row = report["runs"][0]
+    assert row["status"] == "failed"
+    assert row["wer_raw"] == 0
+    assert row["cer_raw"] == 0
+    assert row["failure"] == "extract: RuntimeError: Ollama returned invalid JSON"
+    assert report["details"]["r"]["metrics"]["english_transcript"] is not None
+
+
+def test_summary_token_budget_failure_keeps_numeric_diagnostic(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "recording.wav"
+    recording.write_bytes(b"audio")
+    reference = tmp_path / "reference.txt"
+    reference.write_text("SAP S/4HANA and 123", encoding="utf-8")
+    budget = (
+        "Ollama request exceeds token budget: "
+        "estimated 9000 input + 2048 output exceeds num_ctx 8192"
+    )
+
+    def fail_summary(instructions: str, content: dict[str, str]) -> str:
+        if instructions.startswith("Write"):
+            raise ValueError(budget)
+        if instructions.startswith("Extract"):
+            return json.dumps({section.value: [] for section in FACT_SECTIONS})
+        return json.dumps(content)
+
+    report = run_suite(
+        {"name": "failed", "recording": str(recording),
+         "reference_transcript": str(reference), "output_dir": str(tmp_path / "out"),
+         "run": [{"name": "r", "pipeline": "two-step"}]},
+        lambda config, settings: _make_app(
+            config, settings,
+            stt_obj=FakeSpeechToText([Segment("s1", 0, 1, "SAP S/4HANA and 123")]),
+            llm_obj=FakeLLM(responder=fail_summary),
+        ), sampler=FakeSampler(), audio_preparer=FakeAudio(),
+    )
+    assert report["runs"][0]["failure"] == f"summary: ValueError: {budget}"

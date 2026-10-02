@@ -101,9 +101,12 @@ def score_facts(
         "technical_detail": [],
     }
     current = ""
+    current_label = ""
+    all_entries: list[dict[str, str]] = []
     for line in markdown.splitlines():
         if line.startswith("## "):
-            heading = line[3:].lower()
+            current_label = line[3:].strip()
+            heading = current_label.lower()
             current = (
                 "decision"
                 if heading == "decisions"
@@ -113,37 +116,43 @@ def score_facts(
                 if heading == "technical details"
                 else ""
             )
-        elif current == "decision" and re.match(r"\s*-\s*D\d+:", line):
-            sections[current].append({"text": line, "owner": "", "due": ""})
-        elif (
-            current == "action_item"
-            and line.startswith("|")
-            and not re.search(r"---", line)
-        ):
+        elif line.startswith("|") and not re.search(r"---", line):
             cols = [col.strip() for col in line.strip("|").split("|")]
             if len(cols) >= 4 and cols[0] != "#":
-                sections[current].append(
-                    {"text": cols[1], "owner": cols[2], "due": cols[3]}
-                )
-        elif current == "technical_detail" and line.startswith("-"):
-            sections[current].append({"text": line, "owner": "", "due": ""})
+                entry = {"text": cols[1], "owner": cols[2], "due": cols[3], "section": current_label}
+                if current == "action_item":
+                    sections[current].append(entry)
+                all_entries.append(entry)
+        elif line.lstrip().startswith(("-", "*")):
+            entry = {"text": line, "owner": "", "due": "", "section": current_label}
+            if (current == "decision" and re.match(r"\s*-\s*D\d+:", line)) or current == "technical_detail":
+                sections[current].append(entry)
+            all_entries.append(entry)
+        elif current_label.lower() == "summary" and line.strip():
+            entry = {"text": line.strip(), "owner": "", "due": "", "section": current_label}
+            all_entries.append(entry)
     found: list[str] = []
     wrong: list[str] = []
     missing: list[str] = []
-    results: list[dict[str, str]] = []
-    matched: set[tuple[str, int]] = set()
+    results: list[dict[str, Any]] = []
+    matched: set[int] = set()
     for fact in facts:
         kind = str(fact["kind"])
         expect = [normalize(str(v)) for v in fact["expect"]]
         anchors = [normalize(str(v)) for v in fact.get("anchor", [fact["expect"][0]])]
-        candidates = sections.get(kind, [])
+        expected_candidates = sections.get(kind, [])
+        candidates = expected_candidates
         if kind in {"date", "number"}:
             candidates = [
-                {"text": sentence, "owner": "", "due": ""}
+                {"text": sentence, "owner": "", "due": "", "section": ""}
                 for line in markdown.splitlines()
                 for sentence in re.split(r"(?<=[.!?؟؛])\s+", line)
                 if sentence.strip()
             ]
+            expected_candidates = candidates
+        elif kind in sections:
+            fallback = [entry for entry in all_entries if entry not in expected_candidates]
+            candidates = [*expected_candidates, *fallback]
         anchor_matches = [
             (i, entry)
             for i, entry in enumerate(candidates)
@@ -154,9 +163,18 @@ def score_facts(
             for i, entry in anchor_matches
             if all(value in normalize(entry["text"]) for value in expect)
         ]
+        expected_ids = {id(entry) for entry in expected_candidates}
+        def is_expected(entry: dict[str, str], expected_ids: set[int] = expected_ids) -> bool:
+            return id(entry) in expected_ids
+        def prioritize(matches: list[tuple[int, dict[str, str]]]) -> list[tuple[int, dict[str, str]]]:
+            return sorted(matches, key=lambda item: not is_expected(item[1]))
+        valid = prioritize(valid)
+        anchor_matches = prioritize(anchor_matches)
         action_mismatches: list[tuple[int, dict[str, str], list[str]]] = []
         if kind == "action_item":
             for i, entry in valid:
+                if not is_expected(entry):
+                    continue
                 reasons = []
                 if fact.get("owner") and normalize(fact["owner"]) not in normalize(
                     entry["owner"]
@@ -185,27 +203,33 @@ def score_facts(
         ]
         if wrong_matches:
             wrong.append(str(fact["id"]))
+            matched_entry = wrong_matches[0][1]
             results.append(
                 {
                     "id": str(fact["id"]),
                     "statement": str(fact["statement"]),
                     "status": "wrong",
                     "reason": "wrong_if",
+                    "section": matched_entry["section"] or None,
+                    "in_expected_section": is_expected(matched_entry),
                 }
             )
-            matched.add((kind, wrong_matches[0][0]))
+            matched.add(id(wrong_matches[0][1]))
         elif action_mismatches:
             wrong.append(str(fact["id"]))
             mismatch_index, _, reasons = action_mismatches[0]
+            mismatch_entry = next(entry for i, entry, _ in action_mismatches if i == mismatch_index)
             results.append(
                 {
                     "id": str(fact["id"]),
                     "statement": str(fact["statement"]),
                     "status": "wrong",
                     "reason": ",".join(reasons),
+                    "section": mismatch_entry["section"] or None,
+                    "in_expected_section": is_expected(mismatch_entry),
                 }
             )
-            matched.add((kind, mismatch_index))
+            matched.add(id(mismatch_entry))
         elif valid:
             found.append(str(fact["id"]))
             results.append(
@@ -213,9 +237,11 @@ def score_facts(
                     "id": str(fact["id"]),
                     "statement": str(fact["statement"]),
                     "status": "found",
+                    "section": valid[0][1]["section"] or None,
+                    "in_expected_section": is_expected(valid[0][1]),
                 }
             )
-            matched.add((kind, valid[0][0]))
+            matched.add(id(valid[0][1]))
         else:
             missing.append(str(fact["id"]))
             results.append(
@@ -223,13 +249,15 @@ def score_facts(
                     "id": str(fact["id"]),
                     "statement": str(fact["statement"]),
                     "status": "missing",
+                    "section": None,
+                    "in_expected_section": False,
                 }
             )
     invented = [
         entry["text"]
         for kind in ("decision", "action_item")
         for i, entry in enumerate(sections[kind])
-        if (kind, i) not in matched
+        if id(entry) not in matched
     ]
     return {
         "found": found,

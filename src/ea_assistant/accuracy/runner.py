@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import multiprocessing
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -168,13 +169,54 @@ def _serialize(value: Any) -> Any:
     return value
 
 
+_SAFE_FAILURE_MESSAGES = {
+    "Ollama returned invalid JSON",
+    "Ollama returned an incomplete or empty response",
+    "Ollama response exhausted num_ctx and may be truncated",
+    "Ollama GPU still has loaded models after cleanup timeout",
+    "Unable to verify GPU is free: Ollama /api/ps failed",
+}
+
+
+_TOKEN_BUDGET_MESSAGE = re.compile(
+    r"Ollama request exceeds token budget: estimated \d+ input \+ \d+ output exceeds num_ctx \d+"
+)
+
+
+def _safe_message(exc: Exception) -> str | None:
+    message = str(exc)
+    if message in _SAFE_FAILURE_MESSAGES or _TOKEN_BUDGET_MESSAGE.fullmatch(message):
+        return message
+    return None
+
+
+def _safe_failure(exc: Exception, app: Application | None) -> str:
+    message = _safe_message(exc)
+    if app is not None and app.last_failure_reason:
+        reason = app.last_failure_reason
+        if message is not None and reason.endswith(": " + type(exc).__name__):
+            return f"{reason}: {message}"
+        return reason
+    if message is not None:
+        return f"{type(exc).__name__}: {message}"
+    return f"{type(exc).__name__}: run failed"
+
+
 def _table(rows: list[dict[str, Any]]) -> str:
     return table(rows)
 
 
 def _markdown_detail(detail: dict[str, Any]) -> list[str]:
     if "error" in detail:
-        return [f"Failed: {detail['error']}"]
+        lines = [f"Failed: {detail['error']}"]
+        metrics = detail.get("metrics")
+        if metrics:
+            lines.append(f"Artifacts: `{detail.get('artifacts', '—')}`")
+            english = metrics.get("english_transcript")
+            if english:
+                lines.append(f"English Transcript: `{english}`")
+            lines.append("Transcript metrics are included in the run table.")
+        return lines
     metrics = detail["metrics"]
     vocabulary = metrics["vocabulary"]
     lines = [f"Status: {detail['status']}", f"Artifacts: `{detail['artifacts']}`"]
@@ -226,10 +268,13 @@ def _markdown_detail(detail: dict[str, Any]) -> list[str]:
     facts = metrics.get("facts")
     lines += ["", "### Critical facts", ""]
     if facts:
-        lines += ["| ID | Result | Expected fact |", "|---|---|---|"]
+        lines += ["| ID | Result | Section found | Expected fact |", "|---|---|---|---|"]
         for fact in facts["results"]:
             statement = fact["statement"].replace("|", "\\|")
-            lines.append(f"| {fact['id']} | {fact['status']} | {statement} |")
+            section = fact.get("section") or "—"
+            if not fact.get("in_expected_section", False) and section != "—":
+                section += " (other section)"
+            lines.append(f"| {fact['id']} | {fact['status']} | {section} | {statement} |")
         lines.append(
             f"Found: {len(facts['found'])}/{len(facts['results'])} ({facts['found_percent']}%); wrong: {len(facts['wrong'])}; missing: {len(facts['missing'])}."
         )
@@ -262,6 +307,8 @@ def _execute_run(
     sampler: ResourceSampler | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     app: Application | None = None
+    meeting: Any = None
+    aliases: dict[str, str] = {}
     row: dict[str, Any] = {
         "name": run["name"],
         "pipeline": run["pipeline"],
@@ -385,6 +432,7 @@ def _execute_run(
             row.update(
                 {
                     "mom_found": len(f["found"]),
+                    "mom_found_expected": sum(1 for fact in f["results"] if fact["status"] == "found" and fact["in_expected_section"]),
                     "mom_wrong": len(f["wrong"]),
                     "mom_missing": len(f["missing"]),
                     "mom_invented": len(f["invented"]),
@@ -396,6 +444,7 @@ def _execute_run(
                     key: "—"
                     for key in (
                         "mom_found",
+                        "mom_found_expected",
                         "mom_wrong",
                         "mom_missing",
                         "mom_invented",
@@ -423,18 +472,49 @@ def _execute_run(
             "vocabulary_prompt_truncated": prompt_truncated,
         }
     except Exception as exc:  # noqa: BLE001 - each model/config run must fail independently
-        # Keep the failure label content-free; reports must not expose transport details.
         row["status"] = "failed"
         thermal_reason = (
             str(exc) if "Thermal guard stopped processing" in str(exc) else None
         )
-        row["failure"] = (
-            app.last_failure_reason
-            if app is not None and app.last_failure_reason
-            else thermal_reason or f"{type(exc).__name__}: run failed"
-        )
+        row["failure"] = thermal_reason or _safe_failure(exc, app)
         log.warning("Accuracy run %s failed (%s)", run["name"], type(exc).__name__)
         detail = {"error": row["failure"]}
+        transcript_path = meeting.folder / "transcript.md" if meeting is not None else None
+        if transcript_path is not None and transcript_path.exists():
+            text = transcript_path.read_text(encoding="utf-8")
+            hypothesis = "\n".join(
+                match.group(1)
+                for line in text.splitlines()
+                if (match := re.search(r"\*\*[^*]+:\*\* (.*)$", line))
+            )
+            if hypothesis:
+                metrics = _serialize(score_text(reference, hypothesis, aliases))
+                segments = app.store.segments(meeting.id) if app is not None else []
+                flags = flag_recall(
+                    reference, segments,
+                    float(data.get("flag_cer_threshold", 0.25)),
+                    float(data.get("flag_logprob_threshold", -0.8)),
+                    meeting.duration,
+                )
+                vocabulary = vocabulary_accuracy(reference, hypothesis, terms)
+                numbers = number_accuracy(reference, hypothesis)
+                detail["metrics"] = {
+                    "transcript": _serialize(metrics), "flags": flags,
+                    "vocabulary": vocabulary, "numbers": numbers,
+                    "english_transcript": str(meeting.folder / "english-transcript.md")
+                    if (meeting.folder / "english-transcript.md").exists() else None,
+                }
+                for key, metric_key in (("wer_raw", "wer_raw"), ("wer_norm", "wer_normalized"),
+                                        ("cer_raw", "cer_raw"), ("cer_norm", "cer_normalized")):
+                    row[key] = metrics[metric_key]["rate"]
+                row["vocab_recognized_percent"] = vocabulary["recognized_rate"] * 100 if vocabulary.get("recognized_rate") is not None else None
+                row["number_recall"] = numbers.get("recall")
+                combined = flags["combined"]
+                row.update({"flag_recall": combined["recall"],
+                            "real_error_segments": combined["real_error_segments"],
+                            "flagged_segments": combined["flagged_segments"]})
+        if meeting is not None:
+            detail["artifacts"] = str(meeting.folder)
     return row, detail
 
 
