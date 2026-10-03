@@ -170,7 +170,13 @@ class Application:
             for key, value in self.prompt_settings.stt_prompt_values().items()
             if value is not None
         }
-        stt_config = replace(self.config.stt, **stt_values)
+        stt_config = replace(
+            self.config.stt,
+            **stt_values,
+            vocabulary=tuple(
+                term.canonical for term in self.prompt_settings.stt_vocabulary
+            ),
+        )
         try:
             segments, stt_model, compute_type = self.stt.transcribe(
                 str(normalized_path), stt_config
@@ -185,6 +191,7 @@ class Application:
         for segment in segments:
             self._mark_segment_flags(segment)
         self.store.save_segments(meeting.id, segments)
+        vocabulary_applied = getattr(self.stt, "vocabulary_applied", None)
         self._publish(
             meeting,
             "transcript",
@@ -194,7 +201,14 @@ class Application:
                 models={stt_model: {"digest": self.stt.model_identifier}},
                 compute_type=compute_type,
                 prompt_version=PROMPT_VERSION,
-                decoding=self.config.stt.adapter_values(),
+                decoding={
+                    **self.config.stt.adapter_values(),
+                    **(
+                        {"vocabulary_applied": vocabulary_applied}
+                        if isinstance(vocabulary_applied, bool)
+                        else {}
+                    ),
+                },
                 prompt_variant=self.prompt_settings.prompt_variant,
                 vocabulary=self.prompt_settings.vocabulary_snapshot("transcript"),
             ),

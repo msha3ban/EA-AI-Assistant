@@ -190,8 +190,10 @@ def load_vocabulary(path: str | Path) -> Vocabulary:
 
 
 def merge_config(base: AppConfig, run: dict[str, Any], data_dir: Path) -> AppConfig:
-    allowed_stt = set(STTConfig.__dataclass_fields__)
+    allowed_stt = set(STTConfig.__dataclass_fields__) - {"vocabulary"}
     stt_overrides = run.get("stt", {})
+    if "vocabulary" in stt_overrides:
+        raise ValueError("[run.stt] vocabulary is managed by the application")
     unknown = set(stt_overrides) - allowed_stt
     if unknown:
         raise ValueError(f"Unknown [run.stt] keys: {', '.join(sorted(unknown))}")
