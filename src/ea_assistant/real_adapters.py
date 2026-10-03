@@ -107,6 +107,43 @@ def _read_normalized_wav(path: str) -> Any:
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
 
+def _align_word_probabilities(
+    model: Any, audio: Any, segment: Any, language: str
+) -> tuple[float, ...]:
+    """Align decoded tokens on audio starting at the segment's start.
+
+    For a segment longer than 30 seconds, only its first 30 seconds are used;
+    the decoded tokens are left intact and no later audio is encoded.
+    """
+    from faster_whisper.audio import pad_or_trim
+    from faster_whisper.tokenizer import Tokenizer
+
+    tokenizer = Tokenizer(
+        model.hf_tokenizer,
+        model.model.is_multilingual,
+        task="transcribe",
+        language=language,
+    )
+    text_tokens = [token for token in segment.tokens if token < tokenizer.eot]
+    if not text_tokens:
+        return ()
+
+    extractor = model.feature_extractor
+    start_sample = round(float(segment.start) * extractor.sampling_rate)
+    window = audio[start_sample : start_sample + extractor.n_samples]
+    features = extractor(window)
+    num_frames = min(features.shape[-1] - 1, extractor.nb_max_frames)
+    encoder_output = model.encode(pad_or_trim(features, extractor.nb_max_frames))
+    words = model.find_alignment(
+        tokenizer, [text_tokens], encoder_output, num_frames
+    )[0]
+    return tuple(
+        round(float(word["probability"]), 4)
+        for word in words
+        if word["probability"] is not None
+    )
+
+
 class FasterWhisper:
     def __init__(self) -> None:
         self.model_identifier = "unknown"
@@ -164,7 +201,6 @@ class FasterWhisper:
                 beam_size=config.beam_size,
                 vad_filter=config.vad_filter,
                 vad_parameters=config.vad_parameters,
-                word_timestamps=True,
                 **kwargs,
             )
             self.detected_language = getattr(info, "language", None)
@@ -172,8 +208,22 @@ class FasterWhisper:
             self.language_probability = (
                 float(probability) if probability is not None else None
             )
-            segments = [
-                Segment(
+            segments = []
+            warned_alignment = False
+            language = self.detected_language or (
+                config.language if config.language != "auto" else "en"
+            )
+            for i, s in enumerate(raw, 1):
+                try:
+                    word_probabilities = _align_word_probabilities(
+                        model, audio, s, language
+                    )
+                except Exception:  # noqa: BLE001
+                    word_probabilities = ()
+                    if not warned_alignment:
+                        log.warning("Word probability alignment unavailable")
+                        warned_alignment = True
+                segments.append(Segment(
                     f"s{i:04d}",
                     float(s.start),
                     float(s.end),
@@ -181,14 +231,9 @@ class FasterWhisper:
                     float(s.avg_logprob),
                     float(s.no_speech_prob),
                     float(s.compression_ratio),
-                    word_probabilities=tuple(
-                        round(float(word.probability), 4)
-                        for word in (s.words or ())
-                        if word.probability is not None
-                    ),
-                )
-                for i, s in enumerate(raw, 1)
-            ]
+                    word_probabilities=word_probabilities,
+                    confidence_signals=bool(word_probabilities),
+                ))
             compute_type = (
                 getattr(getattr(model, "model", None), "compute_type", None)
                 or config.compute_type

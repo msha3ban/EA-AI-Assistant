@@ -152,6 +152,111 @@ def test_faster_whisper_receives_decoded_samples_not_a_path(
     assert audio.tolist() == pytest.approx([0.0, 0.5, -1.0, 32767 / 32768])
 
 
+def test_faster_whisper_aligns_decoded_tokens_without_changing_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    np = pytest.importorskip("numpy")
+    wav = tmp_path / "normalized.wav"
+    with wave.open(str(wav), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b"\x00\x00" * 32000)
+
+    calls: dict[str, Any] = {"aligned": [], "encoded": []}
+
+    class FakeTokenizer:
+        eot = 100
+
+        def __init__(self, hf: object, multilingual: bool, *, task: str, language: str):
+            assert hf == "hf" and multilingual and task == "transcribe"
+            assert language == "ar"
+
+    class FakeExtractor:
+        sampling_rate = 16000
+        n_samples = 480000
+        nb_max_frames = 3000
+
+        def __call__(self, audio: Any) -> Any:
+            assert len(audio) in (32000, 16000)
+            return np.zeros((2, len(audio) // 160 + 1), dtype=np.float32)
+
+    class FakeModel:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.model = types.SimpleNamespace(
+                compute_type="int8_float32", is_multilingual=True
+            )
+            self.hf_tokenizer = "hf"
+            self.feature_extractor = FakeExtractor()
+
+        def transcribe(self, audio: Any, **kwargs: Any) -> tuple[Any, Any]:
+            calls["decode"] = kwargs
+            segments = [
+                types.SimpleNamespace(
+                    start=start, end=end, text=text, tokens=tokens,
+                    avg_logprob=-0.1, no_speech_prob=0.01,
+                    compression_ratio=1.0,
+                )
+                for start, end, text, tokens in (
+                    (0.0, 1.0, "first", [101, 4, 5, 102]),
+                    (1.0, 2.0, "second", [101, 6, 102]),
+                    (1.0, 2.0, "third", [101, 6, 102]),
+                )
+            ]
+            return iter(segments), types.SimpleNamespace(
+                language="ar", language_probability=0.97
+            )
+
+        def encode(self, features: Any) -> object:
+            calls["encoded"].append(features.shape)
+            return object()
+
+        def find_alignment(
+            self, tokenizer: Any, text_tokens: Any, encoder_output: object,
+            num_frames: int,
+        ) -> Any:
+            calls["aligned"].append((text_tokens, num_frames))
+            if text_tokens == [[6]]:
+                raise RuntimeError("private recording text")
+            return [[{"probability": 0.43216}, {"probability": 0.75}]]
+
+    fake = types.ModuleType("faster_whisper")
+    fake.__path__ = []  # type: ignore[attr-defined]
+    fake.WhisperModel = FakeModel  # type: ignore[attr-defined]
+    fake.download_model = lambda model, **kwargs: str(tmp_path)  # type: ignore[attr-defined]
+    tokenizer_module = types.ModuleType("faster_whisper.tokenizer")
+    tokenizer_module.Tokenizer = FakeTokenizer  # type: ignore[attr-defined]
+    audio_module = types.ModuleType("faster_whisper.audio")
+
+    def pad_or_trim(features: Any, length: int) -> Any:
+        return np.pad(features, ((0, 0), (0, length - features.shape[-1])))
+
+    audio_module.pad_or_trim = pad_or_trim  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+    monkeypatch.setitem(sys.modules, "faster_whisper.tokenizer", tokenizer_module)
+    monkeypatch.setitem(sys.modules, "faster_whisper.audio", audio_module)
+
+    segments, _, _ = FasterWhisper().transcribe(
+        str(wav), STTConfig(model=str(tmp_path), language="ar")
+    )
+
+    assert "word_timestamps" not in calls["decode"]
+    assert [(s.start, s.end, s.text) for s in segments] == [
+        (0.0, 1.0, "first"), (1.0, 2.0, "second"),
+        (1.0, 2.0, "third"),
+    ]
+    assert calls["aligned"] == [([[4, 5]], 200), ([[6]], 100), ([[6]], 100)]
+    assert calls["encoded"] == [(2, 3000), (2, 3000), (2, 3000)]
+    assert segments[0].word_probabilities == (0.4322, 0.75)
+    assert segments[0].confidence_signals is True
+    assert segments[1].word_probabilities == ()
+    assert segments[1].confidence_signals is False
+    assert segments[2].word_probabilities == ()
+    assert segments[2].confidence_signals is False
+    assert caplog.text.count("Word probability alignment unavailable") == 1
+    assert "private recording text" not in caplog.text
+
+
 def test_faster_whisper_rejects_wav_that_is_not_16khz_mono(tmp_path: Path) -> None:
     pytest.importorskip("numpy")
     wav = tmp_path / "stereo.wav"
