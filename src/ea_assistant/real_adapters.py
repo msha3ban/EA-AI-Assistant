@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import glob
+import gzip
 import hashlib
 import logging
+import math
 import os
 import subprocess
 import wave
@@ -13,6 +15,11 @@ from .config import STTConfig
 from .models import Segment
 
 log = logging.getLogger(__name__)
+SAMPLE_RATE = 16000
+MAX_CHUNK_SECONDS = 30
+MAX_CHUNK_SAMPLES = MAX_CHUNK_SECONDS * SAMPLE_RATE
+MAX_MERGE_GAP_SECONDS = 1.0
+MAX_MERGE_GAP_SAMPLES = int(MAX_MERGE_GAP_SECONDS * SAMPLE_RATE)
 
 
 class FfmpegAudio:
@@ -100,6 +107,43 @@ def _read_normalized_wav(path: str) -> Any:
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
 
+def _align_word_probabilities(
+    model: Any, audio: Any, segment: Any, language: str
+) -> tuple[float, ...]:
+    """Align decoded tokens on audio starting at the segment's start.
+
+    For a segment longer than 30 seconds, only its first 30 seconds are used;
+    the decoded tokens are left intact and no later audio is encoded.
+    """
+    from faster_whisper.audio import pad_or_trim
+    from faster_whisper.tokenizer import Tokenizer
+
+    tokenizer = Tokenizer(
+        model.hf_tokenizer,
+        model.model.is_multilingual,
+        task="transcribe",
+        language=language,
+    )
+    text_tokens = [token for token in segment.tokens if token < tokenizer.eot]
+    if not text_tokens:
+        return ()
+
+    extractor = model.feature_extractor
+    start_sample = round(float(segment.start) * extractor.sampling_rate)
+    window = audio[start_sample : start_sample + extractor.n_samples]
+    features = extractor(window)
+    num_frames = min(features.shape[-1] - 1, extractor.nb_max_frames)
+    encoder_output = model.encode(pad_or_trim(features, extractor.nb_max_frames))
+    words = model.find_alignment(
+        tokenizer, [text_tokens], encoder_output, num_frames
+    )[0]
+    return tuple(
+        round(float(word["probability"]), 4)
+        for word in words
+        if word["probability"] is not None
+    )
+
+
 class FasterWhisper:
     def __init__(self) -> None:
         self.model_identifier = "unknown"
@@ -164,8 +208,22 @@ class FasterWhisper:
             self.language_probability = (
                 float(probability) if probability is not None else None
             )
-            segments = [
-                Segment(
+            segments = []
+            warned_alignment = False
+            language = self.detected_language or (
+                config.language if config.language != "auto" else "en"
+            )
+            for i, s in enumerate(raw, 1):
+                try:
+                    word_probabilities = _align_word_probabilities(
+                        model, audio, s, language
+                    )
+                except Exception:  # noqa: BLE001
+                    word_probabilities = ()
+                    if not warned_alignment:
+                        log.warning("Word probability alignment unavailable")
+                        warned_alignment = True
+                segments.append(Segment(
                     f"s{i:04d}",
                     float(s.start),
                     float(s.end),
@@ -173,9 +231,9 @@ class FasterWhisper:
                     float(s.avg_logprob),
                     float(s.no_speech_prob),
                     float(s.compression_ratio),
-                )
-                for i, s in enumerate(raw, 1)
-            ]
+                    word_probabilities=word_probabilities,
+                    confidence_signals=bool(word_probabilities),
+                ))
             compute_type = (
                 getattr(getattr(model, "model", None), "compute_type", None)
                 or config.compute_type
@@ -207,6 +265,170 @@ class FasterWhisper:
         import gc
 
         gc.collect()
+
+
+class TranscribeCppSpeechToText:
+    """Map token log probability, gzip ratio, and absent silence to Segment signals."""
+
+    def __init__(self) -> None:
+        self.model_identifier = "unknown"
+        self.detected_language: str | None = None
+        self.language_probability: float | None = None
+        self.vocabulary_applied = False
+        self._model: Any = None
+        self._session: Any = None
+        self._binding: Any = None
+
+    def validate_compute_type(self, config: STTConfig) -> None:
+        return None
+
+    def transcribe(
+        self, path: str, config: STTConfig
+    ) -> tuple[list[Segment], str, str]:
+        audio = _read_normalized_wav(path)
+        self.release()
+        try:
+            self._load_model(config)
+            vocabulary = self._choose_vocabulary(config)
+            segments: list[Segment] = []
+            for start, end in self._speech_chunks(audio, config):
+                segment = self._transcribe_chunk(
+                    audio, start, end, config, vocabulary, len(segments) + 1
+                )
+                if segment is not None:
+                    segments.append(segment)
+            self.detected_language = config.language
+            return segments, config.model, config.backend
+        except BaseException:
+            self.release()
+            raise
+
+    def _load_model(self, config: STTConfig) -> None:
+        try:
+            import transcribe_cpp
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "transcribe_cpp binding unavailable; set PYTHONPATH to its "
+                "bindings/python/src and TRANSCRIBE_LIBRARY to libtranscribe.so"
+            ) from exc
+        model_path = Path(config.model).expanduser().resolve()
+        self.model_identifier = self._identifier(model_path)
+        self._binding = transcribe_cpp
+        self._model = transcribe_cpp.Model(str(model_path), backend=config.backend)
+        self._session = self._model.session()
+
+    def _choose_vocabulary(self, config: STTConfig) -> list[str] | None:
+        vocabulary = list(config.vocabulary) or None
+        supported = bool(self._model.supports("vocabulary"))
+        self.vocabulary_applied = bool(vocabulary and supported)
+        if vocabulary and not supported:
+            log.warning(
+                "Configured Vocabulary ignored: local speech-to-text model "
+                "does not support vocabulary"
+            )
+        return vocabulary if self.vocabulary_applied else None
+
+    def _speech_chunks(
+        self, audio: Any, config: STTConfig
+    ) -> list[tuple[int, int]]:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        regions = (
+            get_speech_timestamps(audio, VadOptions(**config.vad_parameters))
+            if config.vad_filter
+            else [{"start": 0, "end": len(audio)}]
+        )
+        return self._chunks(regions, len(audio))
+
+    def _transcribe_chunk(
+        self,
+        audio: Any,
+        start: int,
+        end: int,
+        config: STTConfig,
+        vocabulary: list[str] | None,
+        number: int,
+    ) -> Segment | None:
+        if end <= start:
+            return None
+        flags: list[str] = []
+        try:
+            result = self._session.run(
+                audio[start:end],
+                language=config.language,
+                vocabulary=vocabulary,
+                pnc="default",
+            )
+        except (
+            self._binding.OutputTruncated,
+            self._binding.OutputRepetition,
+        ) as exc:
+            result = exc.partial_result
+            flags.append("repetition loop")
+        value = result.text.strip()
+        if not value:
+            return None
+        probabilities = [
+            float(token.p) for token in result.tokens if token.p is not None
+        ]
+        avg_logprob = (
+            sum(math.log(max(probability, 1e-10)) for probability in probabilities)
+            / len(probabilities)
+            if probabilities
+            else 0.0
+        )
+        encoded = value.encode("utf-8")
+        ratio = len(encoded) / len(gzip.compress(encoded)) if encoded else 0.0
+        return Segment(
+            f"s{number:04d}",
+            start / SAMPLE_RATE,
+            end / SAMPLE_RATE,
+            value,
+            avg_logprob,
+            0.0,
+            ratio,
+            flags,
+            confidence_signals=bool(probabilities),
+        )
+
+    @staticmethod
+    def _chunks(
+        regions: list[dict[str, int]], sample_count: int
+    ) -> list[tuple[int, int]]:
+        chunks: list[tuple[int, int]] = []
+        for region in regions:
+            start = max(0, min(int(region["start"]), sample_count))
+            end = max(start, min(int(region["end"]), sample_count))
+            if chunks:
+                start = max(start, chunks[-1][1])
+            while start < end:
+                if (
+                    chunks
+                    and start - chunks[-1][1] <= MAX_MERGE_GAP_SAMPLES
+                    and end - chunks[-1][0] <= MAX_CHUNK_SAMPLES
+                ):
+                    chunks[-1] = (chunks[-1][0], end)
+                    break
+                stop = min(start + MAX_CHUNK_SAMPLES, end)
+                chunks.append((start, stop))
+                start = stop
+        return chunks
+
+    @staticmethod
+    def _identifier(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as model:
+            for block in iter(lambda: model.read(1024 * 1024), b""):
+                digest.update(block)
+        return "sha256:" + digest.hexdigest()
+
+    def release(self) -> None:
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+        if self._model is not None:
+            self._model.close()
+            self._model = None
 
 
 class MachineSensors:

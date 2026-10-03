@@ -13,4 +13,10 @@ The published normalisation rules are applied in this order:
 
 Flagged Passage scoring applies the same alias normalisation to the reference and each segment before aligning characters and counting real-error segments.
 
+## Detection threshold sweep
+
+Each two-step run reports Flagged Passage recall and precision for the active detectors and a word-probability threshold sweep. The sweep reuses stored segment signals and the same real-error labels; it does not rerun speech-to-text. `[sweep.detection]` accepts `word_probability` and `min_low_confidence_words` arrays. The defaults are `[0.2, 0.35, 0.5, 0.65]` and `[1, 2]`, respectively. A `[[run]]` may override application thresholds under `[run.detection]`. The sweep table contains thresholds, recall, precision, and flagged segment count; undefined rates appear as `n/a`.
+
+The main report's **Flag recall** and **Flag precision** columns use `marker`: segments actually marked as Flagged Passages by the application. Older reports used `combined`, which also counted the suite's separate `avg_logprob < -0.8` check. Their Flag recall values are therefore not directly comparable with current reports. The per-signal table retains both `marker` and `combined` for inspection.
+
 Numbers are compared as multisets. The hand-written number-word coverage includes common Egyptian/MSA forms from zero through twenty (including تلات/تلاتة, تمانية, عشرة/عشره), tens, MSA hundred forms, Egyptian 100–900 forms including مية/ميه and ميتين through تسعمية, and thousand forms including ألفين/الفين = 2,000. It does not parse arbitrary compound number phrases (such as “twenty-five” spoken as words), gender/declension variants not listed in the implementation, fractions, or spoken decimals; digit strings support integers, decimals, and comma-separated thousands.

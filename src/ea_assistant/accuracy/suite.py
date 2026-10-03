@@ -4,7 +4,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..config import AppConfig, StageConfig, STTConfig
+from ..config import (
+    AppConfig,
+    DetectionConfig,
+    StageConfig,
+    STTConfig,
+    valid_detection_value,
+)
 from ..domain import Pipeline, VocabularyPromptMode
 from ..models import Vocabulary, VocabularyTerm
 from .toml_io import load_toml
@@ -23,6 +29,7 @@ class SuiteRun:
     vocabulary_prompt: VocabularyPromptMode
     stt: dict[str, Any]
     llm: dict[str, Any]
+    detection: dict[str, Any] | None = None
 
     def mapping(self) -> dict[str, Any]:
         return {
@@ -31,6 +38,7 @@ class SuiteRun:
             "vocabulary_prompt": self.vocabulary_prompt.value,
             "stt": self.stt,
             "llm": self.llm,
+            "detection": self.detection or {},
         }
 
 
@@ -48,6 +56,7 @@ class Suite:
     flag_cer_threshold: float = 0.25
     flag_logprob_threshold: float = -0.8
     vocabulary_fixture: Vocabulary | None = None
+    sweep_detection: dict[str, list[float] | list[int]] | None = None
 
     def mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -59,6 +68,7 @@ class Suite:
             "run": [run.mapping() for run in self.run],
             "flag_cer_threshold": self.flag_cer_threshold,
             "flag_logprob_threshold": self.flag_logprob_threshold,
+            "sweep": {"detection": self.sweep_detection or default_detection_sweep()},
         }
         if self.excerpt:
             result["excerpt"] = {"start": self.excerpt.start, "end": self.excerpt.end}
@@ -86,6 +96,7 @@ def load_suite(path: str | Path) -> Suite:
         "flag_cer_threshold",
         "flag_logprob_threshold",
         "run",
+        "sweep",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -112,7 +123,9 @@ def load_suite(path: str | Path) -> Suite:
         raise ValueError("Suite must define at least one [[run]]")
     names: set[str] = set()
     for run in raw["run"]:
-        unknown_run = set(run) - {"name", "pipeline", "vocabulary_prompt", "stt", "llm"}
+        unknown_run = set(run) - {
+            "name", "pipeline", "vocabulary_prompt", "stt", "llm", "detection"
+        }
         if unknown_run:
             raise ValueError(f"Unknown run keys: {', '.join(sorted(unknown_run))}")
         for key in ("name", "pipeline"):
@@ -142,6 +155,7 @@ def load_suite(path: str | Path) -> Suite:
             VocabularyPromptMode(run.get("vocabulary_prompt", "off")),
             dict(run.get("stt", {})),
             dict(run.get("llm", {})),
+            dict(run.get("detection", {})),
         )
         for run in raw["run"]
     )
@@ -167,7 +181,43 @@ def load_suite(path: str | Path) -> Suite:
         float(raw.get("flag_cer_threshold", 0.25)),
         float(raw.get("flag_logprob_threshold", -0.8)),
         vocab_fixture,
+        parse_detection_sweep(raw.get("sweep", {}).get("detection", {})),
     )
+
+
+def default_detection_sweep() -> dict[str, list[float] | list[int]]:
+    return {
+        "word_probability": [0.2, 0.35, 0.5, 0.65],
+        "min_low_confidence_words": [1, 2],
+    }
+
+
+def parse_detection_sweep(raw: dict[str, Any]) -> dict[str, list[float] | list[int]]:
+    unknown = set(raw) - {"word_probability", "min_low_confidence_words"}
+    if unknown:
+        raise ValueError(
+            f"Unknown [sweep.detection] keys: {', '.join(sorted(unknown))}"
+        )
+    values = {**default_detection_sweep(), **raw}
+    probabilities = values["word_probability"]
+    minimums = values["min_low_confidence_words"]
+    if not isinstance(probabilities, list) or not probabilities or any(
+        not valid_detection_value(value, probability=True) for value in probabilities
+    ):
+        raise ValueError(
+            "sweep word_probability must be a nonempty list of values between 0 and 1"
+        )
+    if not isinstance(minimums, list) or not minimums or any(
+        not valid_detection_value(value, probability=False) for value in minimums
+    ):
+        raise ValueError(
+            "sweep min_low_confidence_words must be a nonempty list of "
+            "positive integers"
+        )
+    return {
+        "word_probability": [float(value) for value in probabilities],
+        "min_low_confidence_words": minimums,
+    }
 
 
 def load_vocabulary(path: str | Path) -> Vocabulary:
@@ -190,8 +240,19 @@ def load_vocabulary(path: str | Path) -> Vocabulary:
 
 
 def merge_config(base: AppConfig, run: dict[str, Any], data_dir: Path) -> AppConfig:
-    allowed_stt = set(STTConfig.__dataclass_fields__)
+    detection_values = run.get("detection", {})
+    unknown_detection = set(detection_values) - set(
+        DetectionConfig.__dataclass_fields__
+    )
+    if unknown_detection:
+        raise ValueError(
+            f"Unknown [run.detection] keys: {', '.join(sorted(unknown_detection))}"
+        )
+    detection = replace(base.detection, **detection_values)
+    allowed_stt = set(STTConfig.__dataclass_fields__) - {"vocabulary"}
     stt_overrides = run.get("stt", {})
+    if "vocabulary" in stt_overrides:
+        raise ValueError("[run.stt] vocabulary is managed by the application")
     unknown = set(stt_overrides) - allowed_stt
     if unknown:
         raise ValueError(f"Unknown [run.stt] keys: {', '.join(sorted(unknown))}")
@@ -229,4 +290,4 @@ def merge_config(base: AppConfig, run: dict[str, Any], data_dir: Path) -> AppCon
             )
         stages[name] = replace(getattr(base.llm, name), **values)
     llm = replace(base.llm, model=llmraw.get("model", base.llm.model), **stages)
-    return replace(base, data_dir=data_dir, stt=stt, llm=llm)
+    return replace(base, data_dir=data_dir, stt=stt, llm=llm, detection=detection)

@@ -44,9 +44,14 @@ class FakeSensors:
 
 class FakeSpeechToText:
     def __init__(
-        self, segments: list[Segment] | None = None, events: list[str] | None = None
+        self,
+        segments: list[Segment] | None = None,
+        events: list[str] | None = None,
+        word_probabilities: tuple[float, ...] | None = None,
     ) -> None:
         self.segments = segments or [Segment("s0001", 0, 1, "مرحبا", -0.1, 0.01, 1.0)]
+        if word_probabilities is not None:
+            self.segments[0].word_probabilities = word_probabilities
         self.events = events if events is not None else []
         self.calls = 0
         self.configs: list[STTConfig] = []

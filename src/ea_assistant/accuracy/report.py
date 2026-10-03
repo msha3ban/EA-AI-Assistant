@@ -21,6 +21,9 @@ COLUMNS: list[tuple[str, str]] = [
     ("vocab_recognized_percent", "Vocab recognized %"),
     ("number_recall", "Number recall"),
     ("flag_recall", "Flag recall"),
+    ("flag_precision", "Flag precision"),
+    ("active_detectors", "Active detectors"),
+    ("confidence_signals", "Confidence signals"),
     ("real_error_segments", "Real error segments"),
     ("flagged_segments", "Flagged segments"),
     ("mom_found", "MoM found"),
@@ -41,6 +44,7 @@ PERCENT_COLUMNS = {
     "vocab_recognized_percent",
     "number_recall",
     "flag_recall",
+    "flag_precision",
 }
 INTEGER_COLUMNS = {"peak_vram_mib", "peak_ram_mib"}
 

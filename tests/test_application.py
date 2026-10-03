@@ -10,10 +10,11 @@ import pytest
 
 from ea_assistant.adapters import RetryableLLMResponseError
 from ea_assistant.application import Application
-from ea_assistant.config import AppConfig, LLMCallConfig, load_config
+from ea_assistant.config import AppConfig, DetectionConfig, LLMCallConfig, load_config
 from ea_assistant.domain import FACT_SECTIONS, Pipeline, StageName, VocabularyPromptMode
 from ea_assistant.models import Segment, VocabularyTerm
 from ea_assistant.prompts import SUMMARY_COMBINE, PromptSettings
+from ea_assistant.storage import Store
 from ea_assistant.testing import FakeAudio, FakeLLM, FakeSensors, FakeSpeechToText
 
 
@@ -71,12 +72,97 @@ def test_detection_flags_segments(tmp_path: Path) -> None:
     assert "repetition loop" in transcript and "likely text over silence" in transcript
 
 
+def test_word_probability_detection_and_storage(tmp_path: Path) -> None:
+    app = Application(
+        FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
+        replace(
+            config(tmp_path / "data"),
+            detection=DetectionConfig(word_probability=0.5),
+        ),
+    )
+    segment = Segment("s1", 0, 1, "words", word_probabilities=(0.49, 0.5))
+    app._mark_segment_flags(segment)
+    assert segment.flags == ["low-confidence words"]
+    at_threshold = Segment("s2", 0, 1, "ok", word_probabilities=(0.5,))
+    app._mark_segment_flags(at_threshold)
+    assert at_threshold.flags == []
+    app.config = replace(app.config, detection=replace(app.config.detection, min_low_confidence_words=2))
+    only_one = Segment("s3", 0, 1, "ok", word_probabilities=(0.49, 0.5))
+    app._mark_segment_flags(only_one)
+    assert only_one.flags == []
+    meeting = app.create_meeting(str(_recording(tmp_path)), "T", date(2026, 10, 1))
+    app.store.save_segments(meeting.id, [segment])
+    assert app.store.segments(meeting.id)[0].word_probabilities == (0.49, 0.5)
+    signals = app.store.db.execute("SELECT signals FROM transcript_segments").fetchone()[0]
+    assert "words" not in signals
+    assert "0.49" in signals
+
+
+def _recording(tmp_path: Path) -> Path:
+    path = tmp_path / "r.wav"
+    path.write_bytes(b"r")
+    return path
+
+
+def test_old_segment_signals_load_without_word_probabilities(tmp_path: Path) -> None:
+    store = Store(tmp_path / "old.sqlite")
+    store.db.execute("INSERT INTO transcript_segments(meeting_id,id,start,end,text,signals,flags) VALUES(?,?,?,?,?,?,?)",
+                     ("m", "s", 0, 1, "old", '{"avg_logprob": -0.2, "no_speech_prob": 0.1, "compression_ratio": 1.0}', "[]"))
+    store.db.commit()
+    assert store.segments("m")[0].word_probabilities == ()
+    assert store.segments("m")[0].confidence_signals is True
+
+
+def test_active_detector_names_follow_configured_rules() -> None:
+    default = DetectionConfig()
+    assert "low average log probability" not in default.active_detectors()
+    assert "low-confidence words" not in default.active_detectors()
+    configured = replace(default, avg_logprob_only=-0.5)
+    segment = Segment("s", 0, 1, "words", avg_logprob=-0.6)
+    matched = [name for name, rule in configured.detector_rules() if rule(segment)]
+    assert matched == ["low average log probability"]
+    assert set(matched) <= set(configured.active_detectors())
+
+
+def test_default_word_detector_is_off_with_low_confidence_words(tmp_path: Path) -> None:
+    app = Application(FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
+                      config(tmp_path / "data"))
+    segment = Segment("s", 0, 1, "words", word_probabilities=(0.0, 0.1))
+    app._mark_segment_flags(segment)
+    assert app.config.detection.word_probability == 0.0
+    assert app.config.detection.min_low_confidence_words == 1
+    assert segment.flags == []
+    assert "low-confidence words" not in app.config.detection.active_detectors()
+
+
+def test_missing_confidence_signals_skip_confidence_rules_and_survive_storage(
+    tmp_path: Path,
+) -> None:
+    app = Application(
+        FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
+        replace(config(tmp_path / "data"), detection=DetectionConfig(avg_logprob_only=-0.5)),
+    )
+    segment = Segment(
+        "s1", 0, 1, "words", -2, 0.9, 3,
+        word_probabilities=(0.1,), confidence_signals=False,
+    )
+    app._mark_segment_flags(segment)
+    assert segment.flags == ["repetition loop"]
+    meeting = app.create_meeting(str(_recording(tmp_path)), "T", date(2026, 10, 1))
+    app.store.save_segments(meeting.id, [segment])
+    assert app.store.segments(meeting.id)[0].confidence_signals is False
+    signals = json.loads(
+        app.store.db.execute("SELECT signals FROM transcript_segments").fetchone()[0]
+    )
+    assert signals["confidence_signals"] is False
+
+
 def test_default_vocabulary_prompt_reaches_stt_for_normal_processing(
     tmp_path: Path,
 ) -> None:
     recording = tmp_path / "r.m4a"
     recording.write_bytes(b"r")
-    stt = FakeSpeechToText()
+    stt = FakeSpeechToText(word_probabilities=(0.4,))
     app = Application(
         FakeAudio(),
         stt,
@@ -91,6 +177,9 @@ def test_default_vocabulary_prompt_reaches_stt_for_normal_processing(
     app.process(meeting)
     assert stt.configs[0].hotwords == "Kafka"
     assert stt.configs[0].initial_prompt is None
+    stored = app.store.segments(meeting.id)[0]
+    assert stored.word_probabilities == (0.4,)
+    assert "low-confidence words" not in stored.flags
 
 
 def test_thermal_guard_stops_before_transcription(tmp_path: Path) -> None:

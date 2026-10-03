@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import tomllib
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
 from .domain import StageName
+from .models import Segment
 
 DEFAULT_VAD_PARAMETERS: dict[str, Any] = {
     "threshold": 0.5,
@@ -18,9 +21,23 @@ DEFAULT_VAD_PARAMETERS: dict[str, Any] = {
 }
 
 
+def valid_detection_value(value: Any, *, probability: bool) -> bool:
+    if isinstance(value, bool):
+        return False
+    if probability:
+        return (
+            isinstance(value, (int, float))
+            and 0 <= value <= 1
+            and math.isfinite(value)
+        )
+    return isinstance(value, int) and value > 0
+
+
 @dataclass(frozen=True)
 class STTConfig:
+    engine: str = "faster-whisper"
     model: str = "large-v3"
+    backend: str = "auto"
     device: str = "cuda"
     compute_type: str = "int8"
     language: str = "ar"
@@ -32,9 +49,27 @@ class STTConfig:
     download_root: str | None = None
     initial_prompt: str | None = None
     hotwords: str | None = None
+    vocabulary: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.engine not in {"faster-whisper", "transcribe-cpp"}:
+            raise ValueError(f"Unknown speech-to-text engine {self.engine!r}")
+        if self.engine == "transcribe-cpp":
+            if self.language == "auto" or not self.language:
+                raise ValueError(
+                    "transcribe-cpp language must be set; auto is unsupported"
+                )
+            if not self.model.endswith(".gguf"):
+                raise ValueError("transcribe-cpp model must be a .gguf path")
+            if self.backend not in {"auto", "cpu", "cuda", "vulkan"}:
+                raise ValueError(
+                    f"Unsupported transcribe-cpp backend {self.backend!r}"
+                )
 
     def adapter_values(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        values.pop("vocabulary")
+        return values
 
 
 @dataclass(frozen=True)
@@ -98,6 +133,70 @@ class DetectionConfig:
     compression_ratio: float = 2.4
     no_speech_prob: float = 0.7
     avg_logprob: float = -1.0
+    word_probability: float = 0.0
+    min_low_confidence_words: int = 1
+    avg_logprob_only: float | None = None
+
+    def __post_init__(self) -> None:
+        if not valid_detection_value(self.word_probability, probability=True):
+            raise ValueError("word_probability must be between 0 and 1")
+        if not valid_detection_value(
+            self.min_low_confidence_words, probability=False
+        ):
+            raise ValueError("min_low_confidence_words must be a positive integer")
+        if self.avg_logprob_only is not None and (
+            isinstance(self.avg_logprob_only, bool)
+            or not isinstance(self.avg_logprob_only, (int, float))
+            or not math.isfinite(self.avg_logprob_only)
+        ):
+            raise ValueError("avg_logprob_only must be a number or omitted")
+
+    def detector_rules(self) -> tuple[tuple[str, Callable[[Segment], bool]], ...]:
+        rules: list[tuple[str, Callable[[Segment], bool]]] = [
+            (
+                "low-confidence words",
+                lambda segment: segment.confidence_signals
+                and sum(
+                    probability < self.word_probability
+                    for probability in segment.word_probabilities
+                ) >= self.min_low_confidence_words,
+            ),
+        ]
+        if self.avg_logprob_only is not None:
+            rules.append(
+                (
+                    "low average log probability",
+                    lambda segment: (
+                        self.avg_logprob_only is not None
+                        and segment.confidence_signals
+                        and segment.avg_logprob < self.avg_logprob_only
+                    ),
+                )
+            )
+        rules.extend(
+            [
+                (
+                    "repetition loop",
+                    lambda segment: segment.compression_ratio > self.compression_ratio,
+                ),
+                (
+                    "likely text over silence",
+                    lambda segment: (
+                        segment.confidence_signals
+                        and segment.no_speech_prob > self.no_speech_prob
+                        and segment.avg_logprob < self.avg_logprob
+                    ),
+                ),
+            ]
+        )
+        return tuple(rules)
+
+    def active_detectors(self) -> tuple[str, ...]:
+        return tuple(
+            reason
+            for reason, _ in self.detector_rules()
+            if reason != "low-confidence words" or self.word_probability > 0
+        )
 
 
 @dataclass(frozen=True)
@@ -143,7 +242,10 @@ def load_config(path: str | None = None) -> AppConfig:
     )
     if chosen.exists():
         with chosen.open("rb") as f:
-            _merge(raw, tomllib.load(f))
+            user_values = tomllib.load(f)
+        if "vocabulary" in user_values.get("stt", {}):
+            raise ValueError("[stt] vocabulary is managed by the application")
+        _merge(raw, user_values)
     llmraw = raw["llm"]
     stages = llmraw["stages"]
     config = AppConfig(
@@ -165,11 +267,17 @@ def load_config(path: str | None = None) -> AppConfig:
     )
     if not config.allow_remote_endpoint and not _is_loopback(config.llm.endpoint):
         raise ValueError(
-            "Non-loopback LLM endpoint is disabled; set allow_remote_endpoint = true explicitly"
+            "Non-loopback LLM endpoint is disabled; set "
+            "allow_remote_endpoint = true explicitly"
         )
-    if config.stt.compute_type not in {"int8", "int8_float32", "float32"}:
+    if config.stt.engine == "faster-whisper" and config.stt.compute_type not in {
+        "int8",
+        "int8_float32",
+        "float32",
+    }:
         raise ValueError(
-            f"Unsupported Pascal GPU compute type {config.stt.compute_type!r}; use int8, int8_float32, or float32"
+            f"Unsupported Pascal GPU compute type {config.stt.compute_type!r}; "
+            "use int8, int8_float32, or float32"
         )
     return config
 

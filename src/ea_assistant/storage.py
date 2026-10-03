@@ -4,7 +4,7 @@ import json
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .domain import MomState, StageName
 from .models import Meeting, Provenance, Segment
@@ -81,6 +81,8 @@ class Store:
                             "avg_logprob": s.avg_logprob,
                             "no_speech_prob": s.no_speech_prob,
                             "compression_ratio": s.compression_ratio,
+                            "word_probabilities": s.word_probabilities,
+                            "confidence_signals": s.confidence_signals,
                         }
                     ),
                     json.dumps(s.flags),
@@ -95,13 +97,18 @@ class Store:
         self.db.commit()
 
     def segments(self, meeting_id: str) -> list[Segment]:
+        def signals(row: sqlite3.Row) -> dict[str, Any]:
+            values = cast(dict[str, Any], json.loads(row["signals"]))
+            values["word_probabilities"] = tuple(values.get("word_probabilities", ()))
+            return values
+
         return [
             Segment(
                 r["id"],
                 r["start"],
                 r["end"],
                 r["text"],
-                **json.loads(r["signals"]),
+                **signals(r),
                 flags=json.loads(r["flags"]),
                 speaker=r["speaker"],
                 recording_index=r["recording_index"],

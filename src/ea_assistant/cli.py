@@ -19,7 +19,12 @@ from .application import Application
 from .config import AppConfig, load_config
 from .ollama import OllamaClient
 from .prompts import PromptSettings
-from .real_adapters import FasterWhisper, FfmpegAudio, MachineSensors
+from .real_adapters import (
+    FasterWhisper,
+    FfmpegAudio,
+    MachineSensors,
+    TranscribeCppSpeechToText,
+)
 
 
 def build_application(
@@ -28,7 +33,9 @@ def build_application(
 ) -> Application:
     return Application(
         FfmpegAudio(),
-        FasterWhisper(),
+        TranscribeCppSpeechToText()
+        if config.stt.engine == "transcribe-cpp"
+        else FasterWhisper(),
         OllamaClient(
             config.llm.endpoint,
             config.llm.timeout,
@@ -81,6 +88,10 @@ def main(argv: list[str] | None = None, app: Application | None = None) -> int:
         )
         return 0
     if args.command == "setup-models":
+        if config.stt.engine == "transcribe-cpp":
+            raise ValueError(
+                "Download the GGUF model locally and set [stt] model to its path"
+            )
         try:
             from faster_whisper import download_model
 
@@ -104,6 +115,18 @@ def main(argv: list[str] | None = None, app: Application | None = None) -> int:
 
 
 def preflight(config: AppConfig) -> int:
+    if config.stt.engine == "transcribe-cpp":
+        print(
+            json.dumps(
+                {
+                    "stt_engine": "transcribe-cpp",
+                    "preflight": "faster-whisper only",
+                    "model_present": Path(config.stt.model).expanduser().is_file(),
+                },
+                indent=2,
+            )
+        )
+        return 0
     import ctranslate2
     import faster_whisper
 
