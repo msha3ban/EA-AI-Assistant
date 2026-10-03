@@ -73,8 +73,13 @@ def test_detection_flags_segments(tmp_path: Path) -> None:
 
 
 def test_word_probability_detection_and_storage(tmp_path: Path) -> None:
-    app = Application(FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
-                      config(tmp_path / "data"))
+    app = Application(
+        FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
+        replace(
+            config(tmp_path / "data"),
+            detection=DetectionConfig(word_probability=0.5),
+        ),
+    )
     segment = Segment("s1", 0, 1, "words", word_probabilities=(0.49, 0.5))
     app._mark_segment_flags(segment)
     assert segment.flags == ["low-confidence words"]
@@ -111,11 +116,23 @@ def test_old_segment_signals_load_without_word_probabilities(tmp_path: Path) -> 
 def test_active_detector_names_follow_configured_rules() -> None:
     default = DetectionConfig()
     assert "low average log probability" not in default.active_detectors()
+    assert "low-confidence words" not in default.active_detectors()
     configured = replace(default, avg_logprob_only=-0.5)
     segment = Segment("s", 0, 1, "words", avg_logprob=-0.6)
     matched = [name for name, rule in configured.detector_rules() if rule(segment)]
     assert matched == ["low average log probability"]
     assert set(matched) <= set(configured.active_detectors())
+
+
+def test_default_word_detector_is_off_with_low_confidence_words(tmp_path: Path) -> None:
+    app = Application(FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
+                      config(tmp_path / "data"))
+    segment = Segment("s", 0, 1, "words", word_probabilities=(0.0, 0.1))
+    app._mark_segment_flags(segment)
+    assert app.config.detection.word_probability == 0.0
+    assert app.config.detection.min_low_confidence_words == 1
+    assert segment.flags == []
+    assert "low-confidence words" not in app.config.detection.active_detectors()
 
 
 def test_missing_confidence_signals_skip_confidence_rules_and_survive_storage(
@@ -160,7 +177,9 @@ def test_default_vocabulary_prompt_reaches_stt_for_normal_processing(
     app.process(meeting)
     assert stt.configs[0].hotwords == "Kafka"
     assert stt.configs[0].initial_prompt is None
-    assert "low-confidence words" in app.store.segments(meeting.id)[0].flags
+    stored = app.store.segments(meeting.id)[0]
+    assert stored.word_probabilities == (0.4,)
+    assert "low-confidence words" not in stored.flags
 
 
 def test_thermal_guard_stops_before_transcription(tmp_path: Path) -> None:

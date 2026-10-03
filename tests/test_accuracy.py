@@ -562,6 +562,7 @@ def test_two_step_run_all_metrics_vocab_prompts_and_provenance(tmp_path: Path) -
                 "pipeline": "two-step",
                 "vocabulary_prompt": "initial_prompt",
                 "stt": {"language": "auto"},
+                "detection": {"word_probability": 0.5},
             },
             {"name": "hot", "pipeline": "two-step", "vocabulary_prompt": "hotwords"},
         ],
@@ -582,6 +583,12 @@ def test_two_step_run_all_metrics_vocab_prompts_and_provenance(tmp_path: Path) -
     assert row["status"] == "ok" and row["wer_raw"] == 0
     assert row["flagged_segments"] == 1 and row["flag_precision"] == 0
     assert "low-confidence words" in row["active_detectors"]
+    default_row = report["runs"][1]
+    assert "low-confidence words" not in default_row["active_detectors"]
+    assert any(
+        point["flagged_segments"] > 0
+        for point in report["details"]["hot"]["metrics"]["detection_sweep"]
+    )
     assert row["language"] == "auto→ar (0.97)"
     assert (
         stt.configs[0].initial_prompt and "SAP S/4HANA" in stt.configs[0].initial_prompt

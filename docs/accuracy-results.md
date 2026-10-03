@@ -90,3 +90,26 @@ The qwen3:8b run failed at extract with “Ollama returned an incomplete or empt
 `gemma4:12b` is the default for English Transcript, extract and Summary, with thinking off. It had the best median facts found (12/13) and facts in the expected section (3/13) in the end-to-end runs, no failures, and remained within the approximately 4x speed budget. `gemma4:e4b` is the faster TOML option (`[llm] model = "gemma4:e4b"`), at about 3x the end-to-end speed with slightly lower MoM accuracy. `qwen3:8b` failed end to end intermittently and is no longer recommended. The [wayfinder map](https://github.com/msha3ban/EA-AI-Assistant/issues/31), [decision](https://github.com/msha3ban/EA-AI-Assistant/issues/42) and [candidate runs](https://github.com/msha3ban/EA-AI-Assistant/issues/38) retain the related work.
 
 These results use one five-minute Recording. Differences of one fact are within run-to-run noise: speech-to-text output varied slightly, with normalised WER from 38.2% to 41.3%. Invented-candidate counts still need a human read of the MoM.
+
+## 2026-10-03: Cohere Transcribe and word-level Flagged Passages
+
+Cohere Transcribe Arabic 07-2026 ran as GGUF Q8_0 through transcribe.cpp 0.3.0 on CPU; this machine had no CUDA toolkit. The end-to-end runs used two-step MoM generation with gemma4:12b. Facts found are out of 13; the parenthesised number is the count in the expected section.
+
+| Run | WER norm | CER norm | Vocabulary recognised | Facts found (in expected section) | min/audio hour |
+|---|---:|---:|---:|---:|---:|
+| large-v3 + hotwords (reference, this date) | 38.7% | 19.0% | 89% | 12/13 (4) | 126 |
+| Cohere, Vocabulary given to the LLM stages | 44.3% | 27.2% | 52% | 11/13 (3) | 89 |
+| Cohere, no Vocabulary | 44.3% | 27.2% | 52% | 10/13 (3) | 140 |
+
+Cohere takes no Vocabulary and returns no token probabilities, so confidence-based Flagged Passages are unavailable. It transcribed 30 seconds of audio in approximately 12 seconds on CPU. `large-v3` stays the default; the transcribe.cpp engine remains available as an option. See [#45](https://github.com/msha3ban/EA-AI-Assistant/issues/45).
+
+The word-level Flagged Passage measurement used `large-v3` with hotwords and word probabilities from forced alignment after decoding. Of 19 segments, 4 had real errors.
+
+| Word probability | Minimum low-confidence words | Segments flagged | Recall | Precision |
+|---:|---:|---:|---:|---:|
+| 0.5 | 1 | 19/19 | 100% | 21% |
+| 0.2 | 1 | 15/19 | 100% | 27% |
+| 0.1 | 1 | 13/19 | 75% | 23% |
+| 0.1 | 2 | 5/19 | 25% | 20% |
+
+Precision never rose meaningfully above the 21% base rate, so the detector ships off by default. This is based on one Recording with only 4 error segments; segments averaged approximately 15 seconds after VAD. On this Recording, faster-whisper's `word_timestamps=True` changed decoding and raised normalised WER from 39% to 61%, which is why word probabilities come from alignment after decoding. The report's Flag recall column now measures the application's flags; see [the scoring definition](accuracy-normalisation.md). See [#46](https://github.com/msha3ban/EA-AI-Assistant/issues/46).

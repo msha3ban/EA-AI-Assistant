@@ -133,7 +133,7 @@ class DetectionConfig:
     compression_ratio: float = 2.4
     no_speech_prob: float = 0.7
     avg_logprob: float = -1.0
-    word_probability: float = 0.5
+    word_probability: float = 0.0
     min_low_confidence_words: int = 1
     avg_logprob_only: float | None = None
 
@@ -192,7 +192,11 @@ class DetectionConfig:
         return tuple(rules)
 
     def active_detectors(self) -> tuple[str, ...]:
-        return tuple(reason for reason, _ in self.detector_rules())
+        return tuple(
+            reason
+            for reason, _ in self.detector_rules()
+            if reason != "low-confidence words" or self.word_probability > 0
+        )
 
 
 @dataclass(frozen=True)
