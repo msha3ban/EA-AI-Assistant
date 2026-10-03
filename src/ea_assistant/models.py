@@ -22,6 +22,7 @@ class Segment:
     recording_index: int = 0
     recording_start: float | None = None
     recording_end: float | None = None
+    word_probabilities: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import tomllib
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
 from .domain import StageName
+from .models import Segment
 
 DEFAULT_VAD_PARAMETERS: dict[str, Any] = {
     "threshold": 0.5,
@@ -98,6 +101,70 @@ class DetectionConfig:
     compression_ratio: float = 2.4
     no_speech_prob: float = 0.7
     avg_logprob: float = -1.0
+    word_probability: float = 0.5
+    min_low_confidence_words: int = 1
+    avg_logprob_only: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.word_probability, bool)
+            or not isinstance(self.word_probability, (int, float))
+            or not math.isfinite(self.word_probability)
+            or not 0 <= self.word_probability <= 1
+        ):
+            raise ValueError("word_probability must be between 0 and 1")
+        if (
+            isinstance(self.min_low_confidence_words, bool)
+            or not isinstance(self.min_low_confidence_words, int)
+            or self.min_low_confidence_words < 1
+        ):
+            raise ValueError("min_low_confidence_words must be a positive integer")
+        if self.avg_logprob_only is not None and (
+            isinstance(self.avg_logprob_only, bool)
+            or not isinstance(self.avg_logprob_only, (int, float))
+            or not math.isfinite(self.avg_logprob_only)
+        ):
+            raise ValueError("avg_logprob_only must be a number or omitted")
+
+    def detector_rules(self) -> tuple[tuple[str, Callable[[Segment], bool]], ...]:
+        rules: list[tuple[str, Callable[[Segment], bool]]] = [
+            (
+                "low-confidence words",
+                lambda segment: sum(
+                    probability < self.word_probability
+                    for probability in segment.word_probabilities
+                ) >= self.min_low_confidence_words,
+            ),
+        ]
+        if self.avg_logprob_only is not None:
+            rules.append(
+                (
+                    "low average log probability",
+                    lambda segment: (
+                        self.avg_logprob_only is not None
+                        and segment.avg_logprob < self.avg_logprob_only
+                    ),
+                )
+            )
+        rules.extend(
+            [
+                (
+                    "repetition loop",
+                    lambda segment: segment.compression_ratio > self.compression_ratio,
+                ),
+                (
+                    "likely text over silence",
+                    lambda segment: (
+                        segment.no_speech_prob > self.no_speech_prob
+                        and segment.avg_logprob < self.avg_logprob
+                    ),
+                ),
+            ]
+        )
+        return tuple(rules)
+
+    def active_detectors(self) -> tuple[str, ...]:
+        return tuple(reason for reason, _ in self.detector_rules())
 
 
 @dataclass(frozen=True)

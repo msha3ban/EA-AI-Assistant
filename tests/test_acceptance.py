@@ -449,6 +449,7 @@ def test_faster_whisper_contract_is_lazy_local_and_released(
                 avg_logprob = -0.1
                 no_speech_prob = 0.01
                 compression_ratio = 1.0
+                words = (types.SimpleNamespace(probability=0.4),)
 
             return [Item()], Info()
 
@@ -488,6 +489,8 @@ def test_faster_whisper_contract_is_lazy_local_and_released(
         },
     )
     segments, model, compute_type = adapter.transcribe(str(local_wav), config)
+    assert observed["transcribe"]["word_timestamps"] is True
+    assert segments[0].word_probabilities == (0.4,)
     adapter.release()
     assert observed["model_ref"]() is None and gc_calls >= 2
     assert (
@@ -500,6 +503,7 @@ def test_faster_whisper_contract_is_lazy_local_and_released(
         "beam_size": 3,
         "vad_filter": True,
         "vad_parameters": config.vad_parameters,
+        "word_timestamps": True,
     }
     assert (
         segments[0].id == "s0001"

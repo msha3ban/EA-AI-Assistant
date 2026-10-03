@@ -203,13 +203,9 @@ class Application:
         return segments
 
     def _mark_segment_flags(self, segment: Segment) -> None:
-        if segment.compression_ratio > self.config.detection.compression_ratio:
-            segment.flags.append("repetition loop")
-        if (
-            segment.no_speech_prob > self.config.detection.no_speech_prob
-            and segment.avg_logprob < self.config.detection.avg_logprob
-        ):
-            segment.flags.append("likely text over silence")
+        for reason, matches in self.config.detection.detector_rules():
+            if matches(segment):
+                segment.flags.append(reason)
 
     def _translate(self, meeting: Meeting, segments: list[Segment]) -> dict[str, str]:
         if self.store.is_stage_complete(meeting.id, StageName.TRANSLATE):

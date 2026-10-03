@@ -13,17 +13,23 @@ from typing import Any
 from .. import ollama
 from ..adapters import Audio
 from ..application import Application
-from ..config import AppConfig
+from ..config import AppConfig, DetectionConfig
 from ..domain import Pipeline, VocabularyPromptMode
 from ..models import Segment
 from ..prompts import WHISPER_PROMPT_TOKEN_LIMIT, PromptSettings
 from ..real_adapters import FfmpegAudio
 from .facts import load_facts, score_facts
-from .flags import flag_recall
+from .flags import detection_sweep, flag_recall
 from .metrics import number_accuracy, score_text, vocabulary_accuracy
 from .report import _cell, table, write_reports
 from .resources import ResourceSampler, SamplingWindow, SystemResourceSampler
-from .suite import Suite, load_suite, load_vocabulary, merge_config
+from .suite import (
+    Suite,
+    load_suite,
+    load_vocabulary,
+    merge_config,
+    parse_detection_sweep,
+)
 from .timestamps import parse_timestamp_prefix
 
 log = logging.getLogger(__name__)
@@ -213,16 +219,18 @@ def _map_metrics_to_row(row: dict[str, Any], metrics: dict[str, Any]) -> None:
     if transcript is None:
         row.update({key: "—" for key in (
             "wer_raw", "wer_norm", "cer_raw", "cer_norm", "flag_recall",
+            "flag_precision",
             "real_error_segments", "flagged_segments",
         )})
     else:
-        flags = metrics["flags"]["combined"]
+        flags = metrics["flags"]["marker"]
         row.update({
             "wer_raw": transcript["wer_raw"]["rate"],
             "wer_norm": transcript["wer_normalized"]["rate"],
             "cer_raw": transcript["cer_raw"]["rate"],
             "cer_norm": transcript["cer_normalized"]["rate"],
             "flag_recall": flags["recall"],
+            "flag_precision": flags["precision"],
             "real_error_segments": flags["real_error_segments"],
             "flagged_segments": flags["flagged_segments"],
         })
@@ -248,6 +256,23 @@ def _map_metrics_to_row(row: dict[str, Any], metrics: dict[str, Any]) -> None:
         row.update({key: "—" for key in (
             "mom_found", "mom_found_expected", "mom_wrong", "mom_missing", "mom_invented"
         )})
+
+
+def _add_detection_metrics(
+    row: dict[str, Any],
+    metrics: dict[str, Any],
+    segments: list[Segment],
+    data: dict[str, Any],
+    detection: DetectionConfig,
+) -> None:
+    grid = parse_detection_sweep(data.get("sweep", {}).get("detection", {}))
+    metrics["detection_sweep"] = detection_sweep(
+        segments,
+        metrics["flags"],
+        [float(value) for value in grid["word_probability"]],
+        [int(value) for value in grid["min_low_confidence_words"]],
+    )
+    row["active_detectors"] = ", ".join(detection.active_detectors())
 
 
 def _markdown_detail(detail: dict[str, Any]) -> list[str]:
@@ -296,6 +321,8 @@ def _markdown_detail(detail: dict[str, Any]) -> list[str]:
         for signal in (
             "repetition_loop",
             "likely_text_over_silence",
+            "low_confidence_words",
+            "low_average_log_probability",
             "marker",
             "low_logprob",
             "combined",
@@ -306,6 +333,26 @@ def _markdown_detail(detail: dict[str, Any]) -> list[str]:
             )
     else:
         lines.append("Not applicable to direct runs.")
+    sweep = metrics.get("detection_sweep")
+    if sweep is not None:
+        lines += [
+            "",
+            "### Detection threshold sweep",
+            "",
+            (
+                "| Word probability | Minimum low-confidence words | Recall | "
+                "Precision | Flagged segments |"
+            ),
+            "|---:|---:|---:|---:|---:|",
+        ]
+        for point in sweep:
+            lines.append(
+                f"| {point['word_probability']:.2f} | "
+                f"{point['min_low_confidence_words']} | "
+                f"{_cell('flag_recall', point['recall'])} | "
+                f"{_cell('flag_precision', point['precision'])} | "
+                f"{point['flagged_segments']} |"
+            )
     facts = metrics.get("facts")
     lines += ["", "### Critical facts", ""]
     if facts:
@@ -437,6 +484,10 @@ def _execute_run(
             float(data.get("flag_logprob_threshold", -0.8)),
             duration,
         )
+        if strategy.uses_stt:
+            _add_detection_metrics(
+                row, report_metrics, run_segments, data, config.detection
+            )
         report_metrics["facts"] = (
             score_facts(result.mom.markdown, critical) if critical else None
         )
@@ -473,6 +524,11 @@ def _execute_run(
                     float(data.get("flag_cer_threshold", 0.25)),
                     float(data.get("flag_logprob_threshold", -0.8)), meeting.duration,
                 )
+                if strategy.uses_stt:
+                    assert app is not None
+                    _add_detection_metrics(
+                        row, metrics, segments, data, app.config.detection
+                    )
                 metrics["facts"] = None
                 english_path = meeting.folder / "english-transcript.md"
                 metrics["english_transcript"] = str(english_path) if english_path.exists() else None

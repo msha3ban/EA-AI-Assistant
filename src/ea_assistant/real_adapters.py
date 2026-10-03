@@ -157,6 +157,7 @@ class FasterWhisper:
                 beam_size=config.beam_size,
                 vad_filter=config.vad_filter,
                 vad_parameters=config.vad_parameters,
+                word_timestamps=True,
                 **kwargs,
             )
             self.detected_language = getattr(info, "language", None)
@@ -173,6 +174,7 @@ class FasterWhisper:
                     float(s.avg_logprob),
                     float(s.no_speech_prob),
                     float(s.compression_ratio),
+                    word_probabilities=tuple(round(float(word.probability), 4) for word in (s.words or ()) if word.probability is not None),
                 )
                 for i, s in enumerate(raw, 1)
             ]

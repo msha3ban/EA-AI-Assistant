@@ -12,7 +12,7 @@ from typing import Any, cast
 import pytest
 
 from ea_assistant.accuracy.facts import CriticalFact, load_facts, score_facts
-from ea_assistant.accuracy.flags import flag_recall
+from ea_assistant.accuracy.flags import detection_sweep, flag_recall
 from ea_assistant.accuracy.metrics import (
     edit_score,
     normalize,
@@ -173,6 +173,46 @@ def test_flag_recall_normalizes_vocabulary_aliases() -> None:
     )
     assert result["real_errors"] == 0
     assert result["segments"][0]["real_error"] is False
+
+
+def test_detection_sweep_reuses_real_error_labels() -> None:
+    segments = [
+        Segment("a", 0, 1, "right", word_probabilities=(0.3,)),
+        Segment("b", 1, 2, "bad", word_probabilities=(0.2, 0.4)),
+        Segment("c", 2, 3, "also bad", word_probabilities=(0.8,)),
+    ]
+    result = flag_recall("right good also good", segments)
+    sweep = detection_sweep(segments, result, [0.25, 0.5], [1, 2])
+    assert sweep[0] == {"word_probability": 0.25, "min_low_confidence_words": 1,
+                        "recall": 0.5, "precision": 1.0, "flagged_segments": 1}
+    assert sweep[2]["recall"] == 0.5
+    assert sweep[2]["precision"] == 0.5
+    assert sweep[3]["flagged_segments"] == 1
+
+
+def test_run_detection_override_and_sweep_parse(tmp_path: Path) -> None:
+    path = tmp_path / "suite.toml"
+    path.write_text('name="x"\nrecording="r.wav"\nreference_transcript="ref.txt"\n'
+                    '[sweep.detection]\nword_probability=[0.3, 0.6]\nmin_low_confidence_words=[1, 2]\n'
+                    '[[run]]\nname="r"\npipeline="two-step"\n'
+                    '[run.detection]\nword_probability=0.3\nmin_low_confidence_words=2\n')
+    suite = load_suite(path)
+    assert suite.sweep_detection == {"word_probability": [0.3, 0.6],
+                                     "min_low_confidence_words": [1, 2]}
+    config = merge_config(AppConfig(), suite.run[0].mapping(), tmp_path)
+    assert config.detection.word_probability == 0.3
+    assert config.detection.min_low_confidence_words == 2
+
+
+def test_detection_config_rejects_invalid_thresholds(tmp_path: Path) -> None:
+    from ea_assistant.config import load_config
+
+    path = tmp_path / "config.toml"
+    for setting in ("word_probability = 1.2", "min_low_confidence_words = 0",
+                    'min_low_confidence_words = "two"'):
+        path.write_text("[detection]\n" + setting)
+        with pytest.raises(ValueError):
+            load_config(str(path))
 
 
 def test_report_uses_na_for_undefined_flag_metrics() -> None:
@@ -448,7 +488,8 @@ def test_two_step_run_all_metrics_vocab_prompts_and_provenance(tmp_path: Path) -
         ],
     }
     apps: list[Application] = []
-    stt = FakeSpeechToText([Segment("s0001", 0, 1, "SAP S/4HANA and 123", -1, 0, 0)])
+    stt = FakeSpeechToText([Segment("s0001", 0, 1, "SAP S/4HANA and 123", -1, 0, 0,
+                                    word_probabilities=(0.4,))])
     llm = FakeLLM()
 
     def factory(config: AppConfig, prompt_settings: PromptSettings) -> Application:
@@ -460,6 +501,8 @@ def test_two_step_run_all_metrics_vocab_prompts_and_provenance(tmp_path: Path) -
     report = run_suite(suite, factory, sampler=FakeSampler(), audio_preparer=preparer)
     row = report["runs"][0]
     assert row["status"] == "ok" and row["wer_raw"] == 0
+    assert row["flagged_segments"] == 1 and row["flag_precision"] == 0
+    assert "low-confidence words" in row["active_detectors"]
     assert row["language"] == "auto→ar (0.97)"
     assert (
         stt.configs[0].initial_prompt and "SAP S/4HANA" in stt.configs[0].initial_prompt
@@ -476,7 +519,11 @@ def test_two_step_run_all_metrics_vocab_prompts_and_provenance(tmp_path: Path) -
         and row["peak_ram_mib"] is not None
     )
     assert "numbers" in report["details"]["r"]["metrics"]
-    assert "Canonical term" in Path(report["report_dir"], "report.md").read_text()
+    markdown = Path(report["report_dir"], "report.md").read_text()
+    assert "Canonical term" in markdown
+    assert "Detection threshold sweep" in markdown
+    assert "Flag precision" in markdown
+    assert "SAP S/4HANA and 123" not in str(report["details"]["r"]["metrics"]["detection_sweep"])
     assert {
         "wer_raw",
         "wer_norm",
@@ -802,6 +849,8 @@ def test_failed_extract_keeps_transcript_metrics_and_safe_ollama_message(
     assert row["cer_raw"] == 0
     assert row["failure"] == "extract: RetryableLLMResponseError: Ollama returned invalid JSON"
     assert report["details"]["r"]["metrics"]["english_transcript"] is not None
+    assert "low-confidence words" in row["active_detectors"]
+    assert "detection_sweep" in report["details"]["r"]["metrics"]
     markdown = (Path(report["report_dir"]) / "report.md").read_text(encoding="utf-8")
     assert "### Vocabulary terms" in markdown
     assert "### Numbers" in markdown
