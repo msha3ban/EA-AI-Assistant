@@ -23,7 +23,9 @@ DEFAULT_VAD_PARAMETERS: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class STTConfig:
+    engine: str = "faster-whisper"
     model: str = "large-v3"
+    backend: str = "auto"
     device: str = "cuda"
     compute_type: str = "int8"
     language: str = "ar"
@@ -35,9 +37,27 @@ class STTConfig:
     download_root: str | None = None
     initial_prompt: str | None = None
     hotwords: str | None = None
+    vocabulary: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.engine not in {"faster-whisper", "transcribe-cpp"}:
+            raise ValueError(f"Unknown speech-to-text engine {self.engine!r}")
+        if self.engine == "transcribe-cpp":
+            if self.language == "auto" or not self.language:
+                raise ValueError(
+                    "transcribe-cpp language must be set; auto is unsupported"
+                )
+            if not self.model.endswith(".gguf"):
+                raise ValueError("transcribe-cpp model must be a .gguf path")
+            if self.backend not in {"auto", "cpu", "cuda", "vulkan"}:
+                raise ValueError(
+                    f"Unsupported transcribe-cpp backend {self.backend!r}"
+                )
 
     def adapter_values(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        values.pop("vocabulary")
+        return values
 
 
 @dataclass(frozen=True)
@@ -210,7 +230,10 @@ def load_config(path: str | None = None) -> AppConfig:
     )
     if chosen.exists():
         with chosen.open("rb") as f:
-            _merge(raw, tomllib.load(f))
+            user_values = tomllib.load(f)
+        if "vocabulary" in user_values.get("stt", {}):
+            raise ValueError("[stt] vocabulary is managed by the application")
+        _merge(raw, user_values)
     llmraw = raw["llm"]
     stages = llmraw["stages"]
     config = AppConfig(
@@ -232,11 +255,17 @@ def load_config(path: str | None = None) -> AppConfig:
     )
     if not config.allow_remote_endpoint and not _is_loopback(config.llm.endpoint):
         raise ValueError(
-            "Non-loopback LLM endpoint is disabled; set allow_remote_endpoint = true explicitly"
+            "Non-loopback LLM endpoint is disabled; set "
+            "allow_remote_endpoint = true explicitly"
         )
-    if config.stt.compute_type not in {"int8", "int8_float32", "float32"}:
+    if config.stt.engine == "faster-whisper" and config.stt.compute_type not in {
+        "int8",
+        "int8_float32",
+        "float32",
+    }:
         raise ValueError(
-            f"Unsupported Pascal GPU compute type {config.stt.compute_type!r}; use int8, int8_float32, or float32"
+            f"Unsupported Pascal GPU compute type {config.stt.compute_type!r}; "
+            "use int8, int8_float32, or float32"
         )
     return config
 
