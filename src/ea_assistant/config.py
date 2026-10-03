@@ -69,7 +69,7 @@ class StageConfig:
 @dataclass(frozen=True)
 class LLMConfig:
     endpoint: str = "http://127.0.0.1:11434"
-    model: str = "qwen3:8b"
+    model: str = "gemma4:12b"
     timeout: float = 120
     translate: StageConfig = field(
         default_factory=lambda: StageConfig(8192, 4096, timeout=600)

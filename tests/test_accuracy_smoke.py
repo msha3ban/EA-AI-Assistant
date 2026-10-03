@@ -33,8 +33,8 @@ def test_example_accuracy_suite_with_local_models(tmp_path: Path) -> None:
     except (OSError, ValueError):
         pytest.skip("Ollama is not available")
     model_names = {str(model.get("name")) for model in models}
-    if "qwen3:8b" not in model_names:
-        pytest.skip("example LLM model qwen3:8b is not installed")
+    if "gemma4:12b" not in model_names:
+        pytest.skip("example LLM model gemma4:12b is not installed")
     cache = Path.home() / ".cache" / "huggingface" / "hub"
     stt_exists = any(cache.glob("models--Systran--faster-whisper-large-v3*"))
     if not stt_exists:

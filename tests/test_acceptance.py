@@ -344,12 +344,17 @@ def test_provenance_stage_models_decoding_and_inputs(tmp_path: Path) -> None:
     assert prov["transcript"].compute_type == "int8"
     for name in ("english_transcript", "summary", "mom"):
         item = prov[name]
-        assert item.models["qwen3:8b"]["digest"] == "llm-digest"
+        assert item.models["gemma4:12b"]["digest"] == "llm-digest"
         assert item.vocabulary == [] and item.decoding
     assert prov["english_transcript"].input_revisions == {"transcript": 1}
     assert prov["summary"].input_revisions == {"english_transcript": 1}
     assert set(prov["mom"].decoding) == {"extract", "summary"}
     assert prov["mom"].decoding["summary"]["num_ctx"] == app.config.llm.summary.num_ctx
+
+
+def test_default_llm_model(tmp_path: Path) -> None:
+    config = load_config(str(tmp_path / "absent.toml"))
+    assert config.llm.model == "gemma4:12b"
 
 
 def test_cli_injection_creates_meeting(

@@ -85,7 +85,7 @@ class FakeLLM:
         self.extract_calls = 0
         self.responder = responder
         self.loaded = False
-        self.digests = {"fake-llm": "llm-digest", "qwen3:8b": "llm-digest"}
+        self.digests = {"fake-llm": "llm-digest", "gemma4:12b": "llm-digest"}
 
     def ensure_gpu_free(self) -> None:
         self.events.append("llm-gpu-free-check")
