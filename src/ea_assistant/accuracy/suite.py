@@ -4,7 +4,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..config import AppConfig, DetectionConfig, StageConfig, STTConfig
+from ..config import (
+    AppConfig,
+    DetectionConfig,
+    StageConfig,
+    STTConfig,
+    valid_detection_value,
+)
 from ..domain import Pipeline, VocabularyPromptMode
 from ..models import Vocabulary, VocabularyTerm
 from .toml_io import load_toml
@@ -117,7 +123,9 @@ def load_suite(path: str | Path) -> Suite:
         raise ValueError("Suite must define at least one [[run]]")
     names: set[str] = set()
     for run in raw["run"]:
-        unknown_run = set(run) - {"name", "pipeline", "vocabulary_prompt", "stt", "llm", "detection"}
+        unknown_run = set(run) - {
+            "name", "pipeline", "vocabulary_prompt", "stt", "llm", "detection"
+        }
         if unknown_run:
             raise ValueError(f"Unknown run keys: {', '.join(sorted(unknown_run))}")
         for key in ("name", "pipeline"):
@@ -178,29 +186,38 @@ def load_suite(path: str | Path) -> Suite:
 
 
 def default_detection_sweep() -> dict[str, list[float] | list[int]]:
-    return {"word_probability": [0.2, 0.35, 0.5, 0.65],
-            "min_low_confidence_words": [1, 2]}
+    return {
+        "word_probability": [0.2, 0.35, 0.5, 0.65],
+        "min_low_confidence_words": [1, 2],
+    }
 
 
 def parse_detection_sweep(raw: dict[str, Any]) -> dict[str, list[float] | list[int]]:
     unknown = set(raw) - {"word_probability", "min_low_confidence_words"}
     if unknown:
-        raise ValueError(f"Unknown [sweep.detection] keys: {', '.join(sorted(unknown))}")
+        raise ValueError(
+            f"Unknown [sweep.detection] keys: {', '.join(sorted(unknown))}"
+        )
     values = {**default_detection_sweep(), **raw}
     probabilities = values["word_probability"]
     minimums = values["min_low_confidence_words"]
     if not isinstance(probabilities, list) or not probabilities or any(
-        isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1
-        for value in probabilities
+        not valid_detection_value(value, probability=True) for value in probabilities
     ):
-        raise ValueError("sweep word_probability must be a nonempty list of values between 0 and 1")
+        raise ValueError(
+            "sweep word_probability must be a nonempty list of values between 0 and 1"
+        )
     if not isinstance(minimums, list) or not minimums or any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 1
-        for value in minimums
+        not valid_detection_value(value, probability=False) for value in minimums
     ):
-        raise ValueError("sweep min_low_confidence_words must be a nonempty list of positive integers")
-    return {"word_probability": [float(value) for value in probabilities],
-            "min_low_confidence_words": minimums}
+        raise ValueError(
+            "sweep min_low_confidence_words must be a nonempty list of "
+            "positive integers"
+        )
+    return {
+        "word_probability": [float(value) for value in probabilities],
+        "min_low_confidence_words": minimums,
+    }
 
 
 def load_vocabulary(path: str | Path) -> Vocabulary:
@@ -224,9 +241,13 @@ def load_vocabulary(path: str | Path) -> Vocabulary:
 
 def merge_config(base: AppConfig, run: dict[str, Any], data_dir: Path) -> AppConfig:
     detection_values = run.get("detection", {})
-    unknown_detection = set(detection_values) - set(DetectionConfig.__dataclass_fields__)
+    unknown_detection = set(detection_values) - set(
+        DetectionConfig.__dataclass_fields__
+    )
     if unknown_detection:
-        raise ValueError(f"Unknown [run.detection] keys: {', '.join(sorted(unknown_detection))}")
+        raise ValueError(
+            f"Unknown [run.detection] keys: {', '.join(sorted(unknown_detection))}"
+        )
     detection = replace(base.detection, **detection_values)
     allowed_stt = set(STTConfig.__dataclass_fields__) - {"vocabulary"}
     stt_overrides = run.get("stt", {})

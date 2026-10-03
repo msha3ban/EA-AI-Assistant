@@ -87,6 +87,8 @@ def test_chunks_signals_vocabulary_truncation_and_release(
 
         def run(self, pcm: object, **kwargs: object) -> object:
             calls.append({"length": len(pcm), **kwargs})  # type: ignore[arg-type]
+            if not supported:
+                return SimpleNamespace(text="مرحبا", tokens=())
             if len(calls) == 2:
                 return SimpleNamespace(text=" ", tokens=())
             if len(calls) == 3:
@@ -133,7 +135,9 @@ def test_chunks_signals_vocabulary_truncation_and_release(
     assert segments[0].avg_logprob == pytest.approx(
         (math.log(0.5) + math.log(0.25)) / 2
     )
+    assert segments[0].confidence_signals is True
     assert any(s.text == "partial" and "repetition loop" in s.flags for s in segments)
+    assert next(s for s in segments if s.text == "partial").confidence_signals is False
     assert all(call["vocabulary"] == ["Kafka", "SAP"] for call in calls)
     assert adapter.vocabulary_applied is True
     assert adapter.model_identifier.startswith("sha256:")
@@ -142,10 +146,33 @@ def test_chunks_signals_vocabulary_truncation_and_release(
 
     supported = False
     calls.clear()
-    adapter.transcribe(str(wav), config)
+    unsupported_segments, _, _ = adapter.transcribe(str(wav), config)
     assert all(call["vocabulary"] is None for call in calls)
     assert adapter.vocabulary_applied is False
+    assert unsupported_segments
+    assert all(not segment.confidence_signals for segment in unsupported_segments)
     adapter.release()
+
+
+@pytest.mark.parametrize(
+    ("regions", "sample_count", "expected"),
+    [
+        ([{"start": 0, "end": 16000}, {"start": 32001, "end": 48000}],
+         64000, [(0, 16000), (32001, 48000)]),
+        ([{"start": 0, "end": 16000}, {"start": 32000, "end": 48000}],
+         64000, [(0, 48000)]),
+        ([{"start": 0, "end": 31 * 16000}],
+         31 * 16000, [(0, 30 * 16000), (30 * 16000, 31 * 16000)]),
+        ([{"start": -100, "end": 32000},
+          {"start": 100000, "end": 200000}],
+         64000, [(0, 32000)]),
+    ],
+)
+def test_chunk_boundaries(
+    regions: list[dict[str, int]], sample_count: int,
+    expected: list[tuple[int, int]],
+) -> None:
+    assert TranscribeCppSpeechToText._chunks(regions, sample_count) == expected
 
 
 def test_missing_binding_error_is_content_free(

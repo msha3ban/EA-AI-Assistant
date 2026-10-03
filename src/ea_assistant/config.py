@@ -21,6 +21,18 @@ DEFAULT_VAD_PARAMETERS: dict[str, Any] = {
 }
 
 
+def valid_detection_value(value: Any, *, probability: bool) -> bool:
+    if isinstance(value, bool):
+        return False
+    if probability:
+        return (
+            isinstance(value, (int, float))
+            and 0 <= value <= 1
+            and math.isfinite(value)
+        )
+    return isinstance(value, int) and value > 0
+
+
 @dataclass(frozen=True)
 class STTConfig:
     engine: str = "faster-whisper"
@@ -126,17 +138,10 @@ class DetectionConfig:
     avg_logprob_only: float | None = None
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.word_probability, bool)
-            or not isinstance(self.word_probability, (int, float))
-            or not math.isfinite(self.word_probability)
-            or not 0 <= self.word_probability <= 1
-        ):
+        if not valid_detection_value(self.word_probability, probability=True):
             raise ValueError("word_probability must be between 0 and 1")
-        if (
-            isinstance(self.min_low_confidence_words, bool)
-            or not isinstance(self.min_low_confidence_words, int)
-            or self.min_low_confidence_words < 1
+        if not valid_detection_value(
+            self.min_low_confidence_words, probability=False
         ):
             raise ValueError("min_low_confidence_words must be a positive integer")
         if self.avg_logprob_only is not None and (
@@ -150,7 +155,8 @@ class DetectionConfig:
         rules: list[tuple[str, Callable[[Segment], bool]]] = [
             (
                 "low-confidence words",
-                lambda segment: sum(
+                lambda segment: segment.confidence_signals
+                and sum(
                     probability < self.word_probability
                     for probability in segment.word_probabilities
                 ) >= self.min_low_confidence_words,
@@ -162,6 +168,7 @@ class DetectionConfig:
                     "low average log probability",
                     lambda segment: (
                         self.avg_logprob_only is not None
+                        and segment.confidence_signals
                         and segment.avg_logprob < self.avg_logprob_only
                     ),
                 )
@@ -175,7 +182,8 @@ class DetectionConfig:
                 (
                     "likely text over silence",
                     lambda segment: (
-                        segment.no_speech_prob > self.no_speech_prob
+                        segment.confidence_signals
+                        and segment.no_speech_prob > self.no_speech_prob
                         and segment.avg_logprob < self.avg_logprob
                     ),
                 ),

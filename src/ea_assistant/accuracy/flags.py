@@ -3,6 +3,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from typing import Any
 
+from ..config import DetectionConfig
 from ..models import Segment
 from .metrics import edit_score, normalize
 
@@ -98,7 +99,7 @@ def flag_recall(
         marker = bool(segment.flags)
         repetition = "repetition loop" in segment.flags
         over_silence = "likely text over silence" in segment.flags
-        low = segment.avg_logprob < logprob_threshold
+        low = segment.confidence_signals and segment.avg_logprob < logprob_threshold
         low_words = "low-confidence words" in segment.flags
         low_average = "low average log probability" in segment.flags
         rows.append(
@@ -155,23 +156,38 @@ def detection_sweep(
     word_probabilities: list[float],
     minimum_words: list[int],
 ) -> list[dict[str, Any]]:
-    errors = [bool(row["real_error"]) for row in labels["segments"]]
-    error_count = sum(errors)
+    errors = {
+        str(row["segment"]): bool(row["real_error"])
+        for row in labels["segments"]
+    }
+    segment_ids = {segment.id for segment in segments}
+    if segment_ids != set(errors) or len(segments) != len(errors):
+        raise ValueError("Detection sweep segment IDs do not match real-error labels")
+    error_count = sum(errors.values())
     rows = []
     for probability in word_probabilities:
         for minimum in minimum_words:
+            detection = DetectionConfig(
+                word_probability=probability,
+                min_low_confidence_words=minimum,
+            )
+            word_rule = dict(detection.detector_rules())["low-confidence words"]
             selected = [
-                sum(value < probability for value in segment.word_probabilities)
-                >= minimum
+                word_rule(segment)
                 for segment in segments
             ]
             flagged = sum(selected)
-            hits = sum(flag and error for flag, error in zip(selected, errors))
-            rows.append({
-                "word_probability": probability,
-                "min_low_confidence_words": minimum,
-                "recall": hits / error_count if error_count else None,
-                "precision": hits / flagged if flagged else None,
-                "flagged_segments": flagged,
-            })
+            hits = sum(
+                flag and errors[segment.id]
+                for flag, segment in zip(selected, segments)
+            )
+            rows.append(
+                {
+                    "word_probability": probability,
+                    "min_low_confidence_words": minimum,
+                    "recall": hits / error_count if error_count else None,
+                    "precision": hits / flagged if flagged else None,
+                    "flagged_segments": flagged,
+                }
+            )
     return rows

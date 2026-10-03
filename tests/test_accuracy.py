@@ -26,10 +26,16 @@ from ea_assistant.accuracy.runner import (
     SubprocessExecutor,
     run_suite,
 )
-from ea_assistant.accuracy.suite import Suite, SuiteRun, load_suite, merge_config
+from ea_assistant.accuracy.suite import (
+    Suite,
+    SuiteRun,
+    load_suite,
+    merge_config,
+    parse_detection_sweep,
+)
 from ea_assistant.adapters import RetryableLLMResponseError
 from ea_assistant.application import Application
-from ea_assistant.config import AppConfig
+from ea_assistant.config import AppConfig, DetectionConfig
 from ea_assistant.domain import FACT_SECTIONS, VocabularyPromptMode
 from ea_assistant.models import Segment
 from ea_assistant.prompts import PromptSettings
@@ -190,6 +196,61 @@ def test_detection_sweep_reuses_real_error_labels() -> None:
     assert sweep[3]["flagged_segments"] == 1
 
 
+def test_detection_sweep_matches_ids_and_excludes_missing_confidence() -> None:
+    segments = [
+        Segment("a", 0, 1, "right", word_probabilities=(0.1,)),
+        Segment("b", 1, 2, "wrong", word_probabilities=(0.1,)),
+        Segment("c", 2, 3, "wrong", word_probabilities=(0.1,),
+                confidence_signals=False),
+    ]
+    labels = {"segments": [
+        {"segment": "c", "real_error": True},
+        {"segment": "a", "real_error": False},
+        {"segment": "b", "real_error": True},
+    ]}
+    assert detection_sweep(segments, labels, [0.5], [1])[0] == {
+        "word_probability": 0.5,
+        "min_low_confidence_words": 1,
+        "recall": 0.5,
+        "precision": 0.5,
+        "flagged_segments": 2,
+    }
+    with pytest.raises(ValueError, match="segment IDs"):
+        detection_sweep(segments, {"segments": labels["segments"][:-1]}, [0.5], [1])
+
+
+def test_run_report_discloses_unavailable_confidence_signals(tmp_path: Path) -> None:
+    recording = tmp_path / "recording.wav"
+    recording.write_bytes(b"audio")
+    reference = tmp_path / "reference.txt"
+    reference.write_text("right", encoding="utf-8")
+    segment = Segment(
+        "s1", 0, 1, "wrong", -2, 0.9, 3,
+        word_probabilities=(0.1,), confidence_signals=False,
+    )
+    report = run_suite(
+        {
+            "name": "missing confidence",
+            "recording": str(recording),
+            "reference_transcript": str(reference),
+            "output_dir": str(tmp_path / "out"),
+            "run": [{"name": "r", "pipeline": "two-step",
+                     "detection": {"avg_logprob_only": -0.5}}],
+        },
+        lambda config, settings: _make_app(
+            config, settings, stt_obj=FakeSpeechToText([segment])
+        ),
+        sampler=FakeSampler(),
+        audio_preparer=FakeAudio(),
+    )
+    row = report["runs"][0]
+    assert row["active_detectors"] == "repetition loop"
+    assert row["confidence_signals"] == "Unavailable for 1 of 1 segments"
+    assert report["details"]["r"]["metrics"]["flags"]["low_logprob"]["flagged_segments"] == 0
+    markdown = (Path(report["report_dir"]) / "report.md").read_text()
+    assert "Confidence signals unavailable for 1 of 1 segments." in markdown
+
+
 def test_run_detection_override_and_sweep_parse(tmp_path: Path) -> None:
     path = tmp_path / "suite.toml"
     path.write_text('name="x"\nrecording="r.wav"\nreference_transcript="ref.txt"\n'
@@ -213,6 +274,24 @@ def test_detection_config_rejects_invalid_thresholds(tmp_path: Path) -> None:
         path.write_text("[detection]\n" + setting)
         with pytest.raises(ValueError):
             load_config(str(path))
+
+
+@pytest.mark.parametrize(
+    "value", [True, -0.1, 1.1, float("nan"), float("inf"), 10**500]
+)
+def test_probability_validation_is_shared(value: Any) -> None:
+    with pytest.raises(ValueError, match="word_probability"):
+        DetectionConfig(word_probability=value)
+    with pytest.raises(ValueError, match="word_probability"):
+        parse_detection_sweep({"word_probability": [value]})
+
+
+@pytest.mark.parametrize("value", [True, 0, 1.5, "2"])
+def test_positive_integer_validation_is_shared(value: Any) -> None:
+    with pytest.raises(ValueError, match="min_low_confidence_words"):
+        DetectionConfig(min_low_confidence_words=value)
+    with pytest.raises(ValueError, match="min_low_confidence_words"):
+        parse_detection_sweep({"min_low_confidence_words": [value]})
 
 
 def test_report_uses_na_for_undefined_flag_metrics() -> None:
@@ -849,7 +928,7 @@ def test_failed_extract_keeps_transcript_metrics_and_safe_ollama_message(
     assert row["cer_raw"] == 0
     assert row["failure"] == "extract: RetryableLLMResponseError: Ollama returned invalid JSON"
     assert report["details"]["r"]["metrics"]["english_transcript"] is not None
-    assert "low-confidence words" in row["active_detectors"]
+    assert "low-confidence words" not in row["active_detectors"]
     assert "detection_sweep" in report["details"]["r"]["metrics"]
     markdown = (Path(report["report_dir"]) / "report.md").read_text(encoding="utf-8")
     assert "### Vocabulary terms" in markdown

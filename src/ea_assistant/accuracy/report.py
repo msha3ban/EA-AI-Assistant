@@ -23,6 +23,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("flag_recall", "Flag recall"),
     ("flag_precision", "Flag precision"),
     ("active_detectors", "Active detectors"),
+    ("confidence_signals", "Confidence signals"),
     ("real_error_segments", "Real error segments"),
     ("flagged_segments", "Flagged segments"),
     ("mom_found", "MoM found"),

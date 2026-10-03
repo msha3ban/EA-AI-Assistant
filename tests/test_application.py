@@ -105,6 +105,7 @@ def test_old_segment_signals_load_without_word_probabilities(tmp_path: Path) -> 
                      ("m", "s", 0, 1, "old", '{"avg_logprob": -0.2, "no_speech_prob": 0.1, "compression_ratio": 1.0}', "[]"))
     store.db.commit()
     assert store.segments("m")[0].word_probabilities == ()
+    assert store.segments("m")[0].confidence_signals is True
 
 
 def test_active_detector_names_follow_configured_rules() -> None:
@@ -115,6 +116,28 @@ def test_active_detector_names_follow_configured_rules() -> None:
     matched = [name for name, rule in configured.detector_rules() if rule(segment)]
     assert matched == ["low average log probability"]
     assert set(matched) <= set(configured.active_detectors())
+
+
+def test_missing_confidence_signals_skip_confidence_rules_and_survive_storage(
+    tmp_path: Path,
+) -> None:
+    app = Application(
+        FakeAudio(), FakeSpeechToText(), FakeLLM(), FakeSensors(),
+        replace(config(tmp_path / "data"), detection=DetectionConfig(avg_logprob_only=-0.5)),
+    )
+    segment = Segment(
+        "s1", 0, 1, "words", -2, 0.9, 3,
+        word_probabilities=(0.1,), confidence_signals=False,
+    )
+    app._mark_segment_flags(segment)
+    assert segment.flags == ["repetition loop"]
+    meeting = app.create_meeting(str(_recording(tmp_path)), "T", date(2026, 10, 1))
+    app.store.save_segments(meeting.id, [segment])
+    assert app.store.segments(meeting.id)[0].confidence_signals is False
+    signals = json.loads(
+        app.store.db.execute("SELECT signals FROM transcript_segments").fetchone()[0]
+    )
+    assert signals["confidence_signals"] is False
 
 
 def test_default_vocabulary_prompt_reaches_stt_for_normal_processing(

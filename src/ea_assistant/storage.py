@@ -82,6 +82,7 @@ class Store:
                             "no_speech_prob": s.no_speech_prob,
                             "compression_ratio": s.compression_ratio,
                             "word_probabilities": s.word_probabilities,
+                            "confidence_signals": s.confidence_signals,
                         }
                     ),
                     json.dumps(s.flags),

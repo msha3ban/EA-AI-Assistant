@@ -272,7 +272,25 @@ def _add_detection_metrics(
         [float(value) for value in grid["word_probability"]],
         [int(value) for value in grid["min_low_confidence_words"]],
     )
-    row["active_detectors"] = ", ".join(detection.active_detectors())
+    has_confidence = any(segment.confidence_signals for segment in segments)
+    has_word_probabilities = any(
+        segment.confidence_signals and segment.word_probabilities
+        for segment in segments
+    )
+    row["active_detectors"] = ", ".join(
+        name
+        for name in detection.active_detectors()
+        if segments
+        and (name not in {"low-confidence words", "low average log probability",
+                          "likely text over silence"} or has_confidence)
+        and (name != "low-confidence words" or has_word_probabilities)
+    )
+    unavailable = sum(not segment.confidence_signals for segment in segments)
+    row["confidence_signals"] = (
+        f"Unavailable for {unavailable} of {len(segments)} segments"
+        if unavailable else "Available"
+    )
+    metrics["flags"]["confidence_signals_unavailable"] = unavailable
 
 
 def _markdown_detail(detail: dict[str, Any]) -> list[str]:
@@ -314,6 +332,15 @@ def _markdown_detail(detail: dict[str, Any]) -> list[str]:
     flags = metrics.get("flags")
     lines += ["", "### Flagged Passage signals", ""]
     if flags:
+        unavailable = flags.get("confidence_signals_unavailable", 0)
+        if unavailable:
+            lines += [
+                (
+                    f"Confidence signals unavailable for {unavailable} of "
+                    f"{flags['segment_count']} segments."
+                ),
+                "",
+            ]
         lines += [
             "| Signal | Recall | Precision | Flagged segments | Segments with real errors | Flags per audio hour |",
             "|---|---:|---:|---:|---:|---:|",

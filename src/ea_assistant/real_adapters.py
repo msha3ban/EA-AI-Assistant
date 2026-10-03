@@ -15,6 +15,11 @@ from .config import STTConfig
 from .models import Segment
 
 log = logging.getLogger(__name__)
+SAMPLE_RATE = 16000
+MAX_CHUNK_SECONDS = 30
+MAX_CHUNK_SAMPLES = MAX_CHUNK_SECONDS * SAMPLE_RATE
+MAX_MERGE_GAP_SECONDS = 1.0
+MAX_MERGE_GAP_SAMPLES = int(MAX_MERGE_GAP_SECONDS * SAMPLE_RATE)
 
 
 class FfmpegAudio:
@@ -176,7 +181,11 @@ class FasterWhisper:
                     float(s.avg_logprob),
                     float(s.no_speech_prob),
                     float(s.compression_ratio),
-                    word_probabilities=tuple(round(float(word.probability), 4) for word in (s.words or ()) if word.probability is not None),
+                    word_probabilities=tuple(
+                        round(float(word.probability), 4)
+                        for word in (s.words or ())
+                        if word.probability is not None
+                    ),
                 )
                 for i, s in enumerate(raw, 1)
             ]
@@ -327,20 +336,20 @@ class TranscribeCppSpeechToText:
         ratio = len(encoded) / len(gzip.compress(encoded)) if encoded else 0.0
         return Segment(
             f"s{number:04d}",
-            start / 16000,
-            end / 16000,
+            start / SAMPLE_RATE,
+            end / SAMPLE_RATE,
             value,
             avg_logprob,
             0.0,
             ratio,
             flags,
+            confidence_signals=bool(probabilities),
         )
 
     @staticmethod
     def _chunks(
         regions: list[dict[str, int]], sample_count: int
     ) -> list[tuple[int, int]]:
-        maximum = 30 * 16000
         chunks: list[tuple[int, int]] = []
         for region in regions:
             start = max(0, min(int(region["start"]), sample_count))
@@ -348,10 +357,14 @@ class TranscribeCppSpeechToText:
             if chunks:
                 start = max(start, chunks[-1][1])
             while start < end:
-                if chunks and start >= chunks[-1][1] and end - chunks[-1][0] <= maximum:
+                if (
+                    chunks
+                    and start - chunks[-1][1] <= MAX_MERGE_GAP_SAMPLES
+                    and end - chunks[-1][0] <= MAX_CHUNK_SAMPLES
+                ):
                     chunks[-1] = (chunks[-1][0], end)
                     break
-                stop = min(start + maximum, end)
+                stop = min(start + MAX_CHUNK_SAMPLES, end)
                 chunks.append((start, stop))
                 start = stop
         return chunks
